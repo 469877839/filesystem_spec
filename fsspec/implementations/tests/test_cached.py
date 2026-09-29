@@ -1837,3 +1837,199 @@ def test_clear_expired_cache_honours_disabled_expiry(tmp_path):
     fs.clear_expired_cache()
 
     assert fs._check_file(path)
+
+
+def _make_source_files(origin, names, size=1000):
+    origin.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for i, name in enumerate(names):
+        p = origin / name
+        p.write_bytes(bytes([i]) * size)
+        paths.append(str(p))
+    return paths
+
+
+def _cache_dir_state(cache):
+    """On-disk metadata and the set of cached data files."""
+    with open(os.path.join(cache, "cache")) as f:
+        meta = json.load(f)
+    files = set(os.listdir(cache)) - {"cache"}
+    return meta, files
+
+
+def _limited_filecache(cache, limit):
+    return fsspec.filesystem(
+        "filecache",
+        target_protocol="file",
+        cache_storage=str(cache),
+        cache_size_limit=limit,
+        skip_instance_cache=True,
+    )
+
+
+def test_cache_size_limit_default_unbounded(tmp_path):
+    origin = tmp_path / "origin"
+    cache = tmp_path / "cache"
+    paths = _make_source_files(origin, ["a", "b", "c"])
+    fs = _limited_filecache(cache, None)
+    assert fs.cache_size_limit is None
+
+    for p in paths:
+        fs.cat(p)
+
+    meta, files = _cache_dir_state(str(cache))
+    assert len(files) == 3  # nothing evicted
+    assert {d["fn"] for d in meta.values()} == files
+
+
+def test_filecache_cache_size_limit_evicts_lru(tmp_path):
+    origin = tmp_path / "origin"
+    cache = tmp_path / "cache"
+    paths = _make_source_files(origin, ["a", "b", "c", "d"])
+    fs = _limited_filecache(cache, 2500)
+
+    for p in paths:
+        assert fs.cat(p)
+
+    meta, files = _cache_dir_state(str(cache))
+    # only the two most recently cached files remain
+    assert sorted(meta) == [make_path_posix(paths[2]), make_path_posix(paths[3])]
+    assert {d["fn"] for d in meta.values()} == files
+    assert sum(os.path.getsize(os.path.join(str(cache), f)) for f in files) <= 2500
+    # an evicted file is fetched again from the origin on demand
+    assert fs.cat(paths[0]) == b"\x00" * 1000
+
+
+def test_filecache_cache_size_limit_lru_access_order(tmp_path):
+    origin = tmp_path / "origin"
+    cache = tmp_path / "cache"
+    paths = _make_source_files(origin, ["a", "b", "c", "d"])
+    fs = _limited_filecache(cache, 3500)
+
+    for p in paths[:3]:
+        fs.cat(p)
+    # read "a" again, making "b" the least recently used
+    assert fs.cat(paths[0]) == b"\x00" * 1000
+    fs.cat(paths[3])
+
+    meta, files = _cache_dir_state(str(cache))
+    assert sorted(meta) == [
+        make_path_posix(paths[0]),
+        make_path_posix(paths[2]),
+        make_path_posix(paths[3]),
+    ]
+    assert {d["fn"] for d in meta.values()} == files
+    # the hit on "a" was recorded; old-style entries without atime are fine
+    assert "atime" in meta[make_path_posix(paths[0])]
+    assert "atime" not in meta[make_path_posix(paths[2])]
+
+
+def test_cache_size_limit_skips_open_files(tmp_path):
+    import gc
+
+    origin = tmp_path / "origin"
+    cache = tmp_path / "cache"
+    paths = _make_source_files(origin, ["a", "b", "c", "d"])
+    fs = _limited_filecache(cache, 2500)
+
+    fs.cat(paths[0])
+    f = fs.open(paths[0], "rb")  # cache hit, held open
+    fs.cat(paths[1])
+    fs.cat(paths[2])
+
+    meta, files = _cache_dir_state(str(cache))
+    # "a" is the least recently used but open, so "b" was evicted instead
+    assert sorted(meta) == [make_path_posix(paths[0]), make_path_posix(paths[2])]
+    assert {d["fn"] for d in meta.values()} == files
+    assert f.read() == b"\x00" * 1000
+
+    # once closed and released, "a" becomes evictable again
+    f.close()
+    del f
+    gc.collect()
+    fs.cat(paths[3])
+    meta, files = _cache_dir_state(str(cache))
+    assert sorted(meta) == [make_path_posix(paths[2]), make_path_posix(paths[3])]
+    assert {d["fn"] for d in meta.values()} == files
+
+
+def test_cache_size_limit_drops_missing_files(tmp_path):
+    # a metadata entry whose file disappeared is removed on the next save,
+    # so metadata and disk stay in agreement
+    origin = tmp_path / "origin"
+    cache = tmp_path / "cache"
+    paths = _make_source_files(origin, ["a", "b", "c"])
+    fs = _limited_filecache(cache, 2500)
+
+    fs.cat(paths[0])
+    fs.cat(paths[1])
+    meta, _ = _cache_dir_state(str(cache))
+    os.remove(os.path.join(str(cache), meta[make_path_posix(paths[0])]["fn"]))
+
+    fs.cat(paths[2])
+
+    meta, files = _cache_dir_state(str(cache))
+    assert sorted(meta) == [make_path_posix(paths[1]), make_path_posix(paths[2])]
+    assert {d["fn"] for d in meta.values()} == files
+
+
+def test_blockcache_cache_size_limit(tmp_path):
+    if win:
+        pytest.skip("Windows file locking affects blockcache eviction")
+    import gc
+
+    origin = tmp_path / "origin"
+    cache = tmp_path / "cache"
+    paths = _make_source_files(origin, ["a", "b", "c"])
+    fs = fsspec.filesystem(
+        "blockcache",
+        target_protocol="file",
+        cache_storage=str(cache),
+        cache_size_limit=2500,
+        skip_instance_cache=True,
+    )
+
+    for p in paths:
+        with fs.open(p, "rb") as f:
+            assert len(f.read()) == 1000
+        # local target files bypass the patched close on context exit, so
+        # in-use marks are released when the file object is collected
+        del f
+        gc.collect()
+
+    meta, files = _cache_dir_state(str(cache))
+    assert sorted(meta) == [make_path_posix(paths[1]), make_path_posix(paths[2])]
+    assert {d["fn"] for d in meta.values()} == files
+    # the evicted file can be read again (and is re-cached)
+    assert len(fs.cat(paths[0])) == 1000
+
+
+def test_cache_size_limit_concurrent_shared_cache(tmp_path):
+    origin = tmp_path / "origin"
+    cache = tmp_path / "cache"
+    paths = _make_source_files(origin, [f"f{i}" for i in range(8)], size=500)
+    limit = 2000
+    errors = []
+
+    def worker():
+        try:
+            fs = _limited_filecache(cache, limit)
+            for p in paths:
+                fs.cat(p)
+        except Exception as e:
+            errors.append(e)
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        list(ex.map(lambda _: worker(), range(4)))
+
+    assert not errors
+    # a final save converges metadata and disk
+    fs = _limited_filecache(cache, limit)
+    fs.save_cache()
+    meta, _ = _cache_dir_state(str(cache))
+    total = 0
+    for d in meta.values():
+        fn = os.path.join(str(cache), d["fn"])
+        assert os.path.exists(fn)  # no metadata record without a file
+        total += os.path.getsize(fn)
+    assert total <= limit

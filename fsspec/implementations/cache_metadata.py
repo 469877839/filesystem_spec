@@ -176,6 +176,34 @@ class CacheMetadata:
             )
         return fn
 
+    def remove_files(self, paths: list[str]) -> None:
+        """Remove metadata of cached files from the writable cache and save.
+
+        Unlike :meth:`save`, the on-disk metadata is rewritten from the
+        in-memory state, so the removed entries are not merged back in from
+        disk. Caller is responsible for deleting the cached files.
+        """
+        for path in paths:
+            self.cached_files[-1].pop(path, None)
+        cache = {k: v.copy() for k, v in self.cached_files[-1].items()}
+        for c in cache.values():
+            if isinstance(c["blocks"], set):
+                c["blocks"] = list(c["blocks"])
+        cache_path = os.path.join(self._storage[-1], "cache")
+        self._save(cache, cache_path)
+
+    def touch_file(self, path: str) -> None:
+        """Record that a cached file was used just now.
+
+        Updates the in-memory ``atime`` of the entry, which is persisted on
+        the next save and used as the recency signal for least-recently-used
+        eviction. Entries loaded from older metadata files have no ``atime``
+        and fall back to their creation ``time``.
+        """
+        for cache in self.cached_files:
+            if path in cache:
+                cache[path]["atime"] = time.time()
+
     def save(self) -> None:
         """Save metadata to disk"""
         for (fn, _, writable), cache in zip(self._scan_locations(), self.cached_files):
@@ -198,6 +226,10 @@ class CacheMetadata:
                             c["blocks"] = blocks
                         c["time"] = max(c["time"], cache[k]["time"])
                         c["uid"] = cache[k]["uid"]
+                        if "atime" in c or "atime" in cache[k]:
+                            c["atime"] = max(
+                                c.get("atime", 0), cache[k].get("atime", 0)
+                            )
 
                 # Files can be added to cache after it was written once
                 for k, c in cache.items():

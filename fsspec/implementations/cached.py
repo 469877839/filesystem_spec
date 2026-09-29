@@ -114,6 +114,7 @@ class CachingFileSystem(ChainedFileSystem):
         compression=None,
         cache_mapper: AbstractCacheMapper | None = None,
         cache_storage_mode=None,
+        cache_size_limit=None,
         **kwargs,
     ):
         """
@@ -163,6 +164,18 @@ class CachingFileSystem(ChainedFileSystem):
             behaviour. Pass an octal mode such as ``0o700`` to keep the cache
             directory, and so the cached data files within it, readable by the
             owner only.
+        cache_size_limit: int (optional)
+            Maximum total size in bytes of the cached files in the writable
+            cache storage. After each write to the cache, if the total size
+            exceeds this value, the least recently used cached files are
+            evicted until the total is back under the limit. Files currently
+            open by this process are never evicted, so the limit may be
+            exceeded while such files are held open. The default of ``None``
+            (or any falsy value) applies no limit, which is the previous
+            behaviour. Only the last (writable) cache location is considered,
+            and only the metadata-based caches (``blockcache``/``cached`` and
+            ``filecache``) enforce the limit; ``simplecache`` keeps no
+            metadata and ignores this option.
         """
         super().__init__(**kwargs)
         if fs is None and target_protocol is None:
@@ -195,6 +208,12 @@ class CachingFileSystem(ChainedFileSystem):
         # recalculated the next time cache_size() is called. On writes to the
         # cache this is reset to None.
         self._cache_size = None
+
+        # Maximum total size in bytes of the writable cache directory, see
+        # _enforce_cache_size_limit(). Falsy means unbounded.
+        self.cache_size_limit = cache_size_limit
+        # Cache files currently open by this process; never evicted.
+        self._files_in_use = set()
 
         if same_names is not None and cache_mapper is not None:
             raise ValueError(
@@ -262,6 +281,83 @@ class CachingFileSystem(ChainedFileSystem):
         self._metadata.save()
         self.last_cache = time.time()
         self._cache_size = None
+        self._enforce_cache_size_limit()
+
+    @contextmanager
+    def _protect_cache_files(self, fns):
+        """Mark cache files as in use by this process within the block.
+
+        Files so marked are skipped by cache size limit eviction, so that
+        files written or about to be read as part of the current operation
+        cannot be evicted out from under it.
+        """
+        if not self.cache_size_limit:
+            yield
+            return
+        self._files_in_use.update(fns)
+        try:
+            yield
+        finally:
+            for fn in fns:
+                self._files_in_use.discard(fn)
+
+    def _enforce_cache_size_limit(self):
+        """Evict least recently used cache files if over cache_size_limit.
+
+        Only the last, writable cache location is considered. Files currently
+        open by this process are skipped, and metadata entries whose file is
+        missing are dropped, so that after eviction metadata and disk agree.
+        Runs after every metadata save; best-effort in the face of other
+        processes sharing the cache directory (no locking is used).
+        """
+        limit = self.cache_size_limit
+        if not limit:
+            return
+        storage = self.storage[-1]
+        entries = []
+        stale = []
+        total = 0
+        for path, detail in self._metadata.cached_files[-1].items():
+            hash = detail.get("fn")
+            if not hash:
+                stale.append(path)
+                continue
+            fn = os.path.join(storage, hash)
+            try:
+                size = os.path.getsize(fn)
+            except OSError:
+                # the file is gone (removed by another process, or after a
+                # crash); its metadata contributes nothing to the cache size
+                stale.append(path)
+                continue
+            total += size
+            entries.append((detail.get("atime", detail.get("time", 0)), path, fn, size))
+        evicted = []
+        if total > limit:
+            entries.sort()
+            for _, path, fn, size in entries:
+                if total <= limit:
+                    break
+                if fn in self._files_in_use:
+                    # currently open by this process
+                    continue
+                try:
+                    os.remove(fn)
+                except OSError:
+                    # open by another process (Windows) or already removed
+                    continue
+                total -= size
+                evicted.append(path)
+            if evicted:
+                logger.debug(
+                    "cache_size_limit=%d exceeded, evicted %d file(s)",
+                    limit,
+                    len(evicted),
+                )
+        removed = stale + evicted
+        if removed:
+            self._metadata.remove_files(removed)
+        self._cache_size = None
 
     def _check_cache(self):
         """Reload caches if time elapsed or any disappeared"""
@@ -278,7 +374,11 @@ class CachingFileSystem(ChainedFileSystem):
         """Is path in cache and still valid"""
         path = self._strip_protocol(path)
         self._check_cache()
-        return self._metadata.check_file(path, self)
+        detail = self._metadata.check_file(path, self)
+        if detail and self.cache_size_limit:
+            # record the hit for least-recently-used eviction
+            self._metadata.touch_file(path)
+        return detail
 
     def clear_cache(self):
         """Remove all files and metadata from the cache
@@ -378,7 +478,12 @@ class CachingFileSystem(ChainedFileSystem):
             if blocks is True:
                 # stored file is complete
                 logger.debug("Opening local copy of %s", path)
-                return open(fn, mode)
+                f = open(fn, mode)
+                if self.cache_size_limit:
+                    # protected from eviction until garbage collected
+                    self._files_in_use.add(fn)
+                    weakref.finalize(f, self._files_in_use.discard, fn)
+                return f
             # TODO: action where partial file exists in read-only cache
             logger.debug("Opening partially cached copy of %s", path)
         else:
@@ -447,6 +552,11 @@ class CachingFileSystem(ChainedFileSystem):
         f.cache = MMapCache(
             f.blocksize, f._fetch_range, f.size, fn, blocks, multi_fetcher=multi_fetcher
         )
+        if self.cache_size_limit:
+            # protected from eviction until closed (see close_and_update)
+            # or garbage collected, whichever comes first
+            self._files_in_use.add(fn)
+            weakref.finalize(f, self._files_in_use.discard, fn)
         close = f.close
         f.close = lambda: self.close_and_update(f, close)
         self.save_cache()
@@ -466,6 +576,7 @@ class CachingFileSystem(ChainedFileSystem):
             return
         path = self._strip_protocol(f.path)
         self._metadata.on_close_cached_file(f, path)
+        location = getattr(f.cache, "location", None)
         try:
             logger.debug("going to save")
             self.save_cache()
@@ -475,6 +586,8 @@ class CachingFileSystem(ChainedFileSystem):
         except NameError:
             logger.debug("Cache save failed due to interpreter shutdown")
         close()
+        if self.cache_size_limit and location is not None:
+            self._files_in_use.discard(location)
         f.closed = True
 
     def ls(self, path, detail=True, **kwargs):
@@ -486,6 +599,8 @@ class CachingFileSystem(ChainedFileSystem):
             "_get_cached_file_before_open",
             "_open",
             "save_cache",
+            "_enforce_cache_size_limit",
+            "_protect_cache_files",
             "close_and_update",
             "__init__",
             "__getattribute__",
@@ -584,6 +699,7 @@ class CachingFileSystem(ChainedFileSystem):
             and self.cache_check == other.cache_check
             and self.check_files == other.check_files
             and self.expiry == other.expiry
+            and self.cache_size_limit == other.cache_size_limit
             and self.compression == other.compression
             and self._mapper == other._mapper
             and self.target_protocol == other.target_protocol
@@ -597,6 +713,7 @@ class CachingFileSystem(ChainedFileSystem):
             ^ hash(self.cache_check)
             ^ hash(self.check_files)
             ^ hash(self.expiry)
+            ^ hash(self.cache_size_limit)
             ^ hash(self.compression)
             ^ hash(self._mapper)
             ^ hash(self.target_protocol)
@@ -662,16 +779,23 @@ class WholeFileCacheFileSystem(CachingFileSystem):
             ]
             for path, detail in zip(downpath, newdetail):
                 self._metadata.update_file(path, detail)
-            self.save_cache()
+            with self._protect_cache_files(downfn0):
+                self.save_cache()
 
         def firstpart(fn):
             # helper to adapt both whole-file and simple-cache
             return fn[1] if isinstance(fn, tuple) else fn
 
-        return [
+        files = [
             open(firstpart(fn0) if fn0 else fn1, mode=open_files.mode)
             for fn0, fn1 in zip(details, downfn0)
         ]
+        if self.cache_size_limit:
+            # protected from eviction until garbage collected
+            for f in files:
+                self._files_in_use.add(f.name)
+                weakref.finalize(f, self._files_in_use.discard, f.name)
+        return files
 
     def commit_many(self, open_files):
         self.fs.put([f.fn for f in open_files], [f.path for f in open_files])
@@ -718,6 +842,9 @@ class WholeFileCacheFileSystem(CachingFileSystem):
             return False
         if detail["blocks"] is not True:
             return False  # a partial blockcache entry sharing this directory
+        if self.cache_size_limit:
+            # record the hit for least-recently-used eviction
+            self._metadata.touch_file(path)
         return fn
 
     async def _download_async(self, path, fn, **kwargs):
@@ -761,7 +888,8 @@ class WholeFileCacheFileSystem(CachingFileSystem):
 
         if getpaths:
             _atomic_get(self.fs, getpaths, storepaths)
-            self.save_cache()
+            with self._protect_cache_files(fns):
+                self.save_cache()
 
         callback.set_size(len(paths))
         for p, fn in zip(paths, fns):
@@ -799,7 +927,8 @@ class WholeFileCacheFileSystem(CachingFileSystem):
         else:
             with _tempfile(fn) as tmp:
                 self.fs.get_file(path, tmp)
-        self.save_cache()
+        with self._protect_cache_files([fn]):
+            self.save_cache()
 
     def _open(self, path, mode="rb", **kwargs):
         path = self._strip_protocol(path)
@@ -830,6 +959,10 @@ class WholeFileCacheFileSystem(CachingFileSystem):
             # `original`.
             f = open(fn, mode)
             f.original = detail.get("original")
+            if self.cache_size_limit:
+                # protected from eviction until garbage collected
+                self._files_in_use.add(fn)
+                weakref.finalize(f, self._files_in_use.discard, fn)
             return f
 
         hash = self._mapper(path)
@@ -851,7 +984,8 @@ class WholeFileCacheFileSystem(CachingFileSystem):
         if not fn:
             fn = os.path.join(self.storage[-1], sha)
             await self._download_async(path, fn, **kwargs)
-            self.save_cache()
+            with self._protect_cache_files([fn]):
+                self.save_cache()
 
         with open(fn, "rb") as f:  # noqa ASYNC230
             if start:
@@ -907,7 +1041,8 @@ class WholeFileCacheFileSystem(CachingFileSystem):
                 return_exceptions=True,
             )
             errors = {p: e for p, e in zip(need, results) if isinstance(e, Exception)}
-            self.save_cache()
+            with self._protect_cache_files(list(need.values())):
+                self.save_cache()
             if errors and on_error == "raise":
                 raise next(iter(errors.values()))
 

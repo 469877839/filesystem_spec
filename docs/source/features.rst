@@ -314,6 +314,14 @@ Cached files can still be removed by age using their local modification times, f
 ``fs.clear_expired_cache(expiry_time=7 * 24 * 60 * 60)``. This only changes the writable cache
 location when multiple cache directories are configured.
 
+The metadata-based variants ("blockcache" and "filecache") can also bound the total
+size of the writable cache directory with ``cache_size_limit`` (in bytes). After every
+write to the cache, if the cached files together exceed the limit, the least recently
+used files are evicted until the total is back under the limit. Files currently open
+by the process are never evicted, and eviction is best-effort when several processes
+share a cache directory (no file locking is used), so the limit may be exceeded
+transiently. "simplecache" keeps no metadata and ignores this option.
+
 With "filecache" and "simplecache", each file is downloaded to a temporary ``*.part`` file in the
 cache directory and renamed into place once complete, so a partial download is never visible. The
 temporary file is removed if the download fails, but not if the process is killed mid-download;
