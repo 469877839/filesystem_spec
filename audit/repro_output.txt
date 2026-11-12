@@ -1,0 +1,200 @@
+fsspec 0.0.post2+gd53423696  target dir: /home/zhihe001/.local/share/domain-feedback/runtimes/domain-20261111-de100-469877839/DF-DE469-20261111-065/2/tmp/fsspec-audit-target-6bm9e8r7
+
+==============================================================================
+L1  local: writes invisible until commit (overwrite + create)
+==============================================================================
+  [PASS] overwrite: old object stays visible  -- b'OLD-P'
+  [PASS] new object does not appear
+  [PASS] no temp file in target dir
+  [PASS] payload lives in system temp file(s)  -- 2 temp files
+  [PASS] new object appears after commit
+  [PASS] overwrite lands after commit
+
+==============================================================================
+L2  local: already-open reader keeps old inode across rename
+==============================================================================
+  [PASS] reader sees old content before commit
+  [PASS] same fd still sees old content
+  [PASS] reader opened after commit sees new content
+
+==============================================================================
+L3  local: exception inside context -> discard all
+==============================================================================
+  [PASS] old object untouched
+  [PASS] new object never appears
+  [PASS] temp files cleaned
+  [PASS] transaction state reset
+
+==============================================================================
+L4  local: commit of file 'b' fails midway -> prefix committed
+==============================================================================
+  [PASS] commit error surfaces to caller  -- injected failure while committing b
+  [PASS] earlier file a is committed and visible
+  [PASS] failed file b never appears
+  [PASS] later file c is discarded
+  [PASS] temp files all cleaned
+  [PASS] state reset after failed complete
+  [PASS] instance usable afterwards; write not silently deferred
+
+==============================================================================
+L5  local: what a reader sees BETWEEN two commits (mixed versions)
+==============================================================================
+  [PASS] mid-commit: first file already new
+  [PASS] mid-commit: second file still old
+  [PASS] mid-commit: third file still old
+  [PASS] after complete: all new
+  [PASS] preexisting: prefix replaced, failed + later files keep OLD content
+
+==============================================================================
+L6  local: cross-device commit is copy+unlink -> partial file VISIBLE
+==============================================================================
+  [PASS] copy failure surfaces  -- injected failure mid copy
+  [PASS] target now holds PARTIAL bytes (old object destroyed)  -- b'PARTIAL'
+  [PASS] state reset after cross-device failure
+
+==============================================================================
+L7  local: rm / cp_file / mv bypass the transaction
+==============================================================================
+  [PASS] rm is immediate and NOT rolled back
+  [PASS] cp_file is immediate and NOT rolled back
+  [PASS] local touch bypasses the transaction (visible immediately)
+
+==============================================================================
+L8  local: same path written twice in one transaction
+==============================================================================
+  [PASS] no conflict detection; queue order decides (last wins)  -- b'SECOND'
+
+==============================================================================
+L9  local: listings cache is not involved
+==============================================================================
+  [PASS] ls sees new file immediately after commit
+  [PASS] dircache never populated by local ls
+
+==============================================================================
+L10  local: autocommit=True inside a transaction bypasses it
+==============================================================================
+  [PASS] autocommit write visible immediately, inside transaction
+  [PASS] escape hatch content persisted
+
+==============================================================================
+L11 local: nested transaction drops writes AND crashes on outer exit
+==============================================================================
+  [PASS] outer context exit crashes with AttributeError  -- AttributeError("'NoneType' object has no attribute '_intrans' and no __dict__ for setting new attributes")
+  [PASS] outer write silently lost (never committed)
+  [PASS] orphaned temp file leaked on disk  -- 1 leaked
+  [PASS] instance left without a live transaction anyway
+
+==============================================================================
+L12 local: only modes containing 'w' are deferred (ab/xb break)
+==============================================================================
+   mode=wb   deferred=True exit_error=None final=b'Z'
+  [PASS] wb: deferred, clean commit
+   mode=xb   deferred=False exit_error=AttributeError final=b'Z'
+  [PASS] xb: writes immediately AND commit raises AttributeError
+  [PASS] xb: transaction state reset after error
+   mode=ab   deferred=False exit_error=AttributeError final=b'baseZ'
+  [PASS] ab: writes immediately AND commit raises AttributeError
+  [PASS] ab: transaction state reset after error
+   mode=r+b  deferred=False exit_error=None final=b'Zase'
+  [PASS] r+b: bypasses transaction silently (immediate mutation, no crash)
+
+==============================================================================
+L13 local: discard itself fails during rollback
+==============================================================================
+  [PASS] discard error masks the user exception
+  [PASS] state still resets
+  [PASS] no payload ever becomes visible
+  [PASS] temp files leak because cleanup itself failed
+
+==============================================================================
+L14 local: process death mid-complete leaves prefix + orphaned temp
+==============================================================================
+  [PASS] child died hard (no exception handling ran)
+  [PASS] prefix file a stays committed
+  [PASS] b never appears
+  [PASS] c never appears
+  [PASS] b's and c's temp files are orphaned on disk (no cleanup at all)  -- 2 orphan(s)
+  [PASS] new process sees mixed state, no auto-repair
+
+==============================================================================
+M1  memory: writes invisible until commit
+==============================================================================
+  [PASS] overwrite: old object stays visible
+  [PASS] new object does not appear
+  [PASS] store untouched mid-transaction
+  [PASS] new object appears after commit
+  [PASS] overwrite lands after commit
+
+==============================================================================
+M2  memory: open reader holds the OLD object after commit
+==============================================================================
+  [PASS] reader sees old content before commit
+  [PASS] same reader object still sees old content
+  [PASS] new open sees new content
+
+==============================================================================
+M3  memory: exception inside context -> nothing visible
+==============================================================================
+  [PASS] old object untouched
+  [PASS] new object never appears
+  [PASS] transaction state reset
+
+==============================================================================
+M4  memory: commit of 'b' fails midway -> prefix committed
+==============================================================================
+  [PASS] commit error surfaces  -- injected failure while committing /b
+  [PASS] earlier file /a committed and visible
+  [PASS] failed file /b never entered store
+  [PASS] later file /c discarded
+  [PASS] state reset after failed complete
+
+==============================================================================
+M5  memory: what a reader sees BETWEEN two commits (mixed versions)
+==============================================================================
+  [PASS] mid-commit: first object already new
+  [PASS] mid-commit: second object still old
+  [PASS] mid-commit: third object still old
+
+==============================================================================
+M6  memory: readers share ONE BytesIO object (cursor is shared)
+==============================================================================
+  [PASS] two opens return the SAME object
+  [PASS] second reader continues from first reader's cursor  -- b'345'
+  [PASS] non-transactional append visible to existing reader immediately
+
+==============================================================================
+M7  memory: rm / cp_file bypass the transaction
+==============================================================================
+  [PASS] cp_file visible immediately, inside transaction
+  [PASS] rm is immediate and NOT rolled back
+  [PASS] cp_file is NOT rolled back
+  [PASS] memory touch IS deferred (invisible until commit)
+  [PASS] memory touch appears after commit
+
+==============================================================================
+M8  memory: append in transaction works on a private copy
+==============================================================================
+  [PASS] store object unchanged before commit
+  [PASS] discarded append leaves original bytes
+  [PASS] committed append appears
+
+==============================================================================
+M9  memory: global store is process-wide, transaction is per-instance
+==============================================================================
+  [PASS] uncommitted write invisible to other instance too
+  [PASS] committed write visible to other instance
+  [PASS] global store is shared dict
+
+==============================================================================
+M10  memory: wb/xb/ab deferred; r+b mutates the shared object immediately
+==============================================================================
+  [PASS] wb: deferred inside transaction
+  [PASS] xb: deferred inside transaction
+  [PASS] ab: store content unchanged inside transaction
+  [PASS] ab commit preserves prefix
+  [PASS] r+b: mutation visible immediately (transaction bypassed)
+  [PASS] r+b: stays mutated after exit
+
+==============================================================================
+SUMMARY: 95/95 probes matched
+==============================================================================
