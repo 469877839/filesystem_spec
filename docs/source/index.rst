@@ -112,6 +112,7 @@ The current list of known implementations can be found as follows
    intro.rst
    usage.rst
    features.rst
+   chained_urls.rst
    copying.rst
    developer.rst
    async.rst
