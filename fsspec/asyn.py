@@ -11,6 +11,7 @@ import os
 import re
 import sys
 import threading
+import time
 from collections.abc import Iterable
 from glob import has_magic
 from typing import TYPE_CHECKING
@@ -42,14 +43,33 @@ def reset_lock():
     _lock = threading.Lock()
 
 
-async def _runner(event, coro, result, timeout=None):
+def _store_result(result, value, state=None, lock=None):
+    if lock is not None and state is not None:
+        with lock:
+            if state["cancelled"]:
+                return
+            result[0] = value
+            state["done"] = True
+    else:
+        result[0] = value
+
+
+async def _runner(event, coro, result, timeout=None, state=None, lock=None):
     timeout = timeout if timeout else None  # convert 0 or 0.0 to None
     if timeout is not None:
         coro = asyncio.wait_for(coro, timeout=timeout)
     try:
-        result[0] = await coro
-    except Exception as ex:
-        result[0] = ex
+        try:
+            value = await coro
+        except asyncio.CancelledError as ex:
+            if state is None or lock is None:
+                raise
+            _store_result(result, ex, state, lock)
+            return
+        except Exception as ex:
+            _store_result(result, ex, state, lock)
+            return
+        _store_result(result, value, state, lock)
     finally:
         event.set()
 
@@ -57,6 +77,9 @@ async def _runner(event, coro, result, timeout=None):
 def sync(loop, func, *args, timeout=None, **kwargs):
     """
     Make loop run coroutine until it returns. Runs in other thread
+
+    On timeout, only the submitted coroutine is cancelled; the loop and any
+    other work running on it are left untouched.
 
     Examples
     --------
@@ -85,15 +108,32 @@ def sync(loop, func, *args, timeout=None, **kwargs):
     coro = func(*args, **kwargs)
     result = [None]
     event = threading.Event()
-    asyncio.run_coroutine_threadsafe(_runner(event, coro, result, timeout), loop)
+    state = {"cancelled": False, "done": False}
+    lock = threading.Lock()
+    runner = _runner(event, coro, result, timeout, state, lock)
+    try:
+        future = asyncio.run_coroutine_threadsafe(runner, loop)
+    except RuntimeError:
+        runner.close()
+        coro.close()
+        raise
+
+    deadline = None if timeout is None else time.monotonic() + timeout
     while True:
-        # this loops allows thread to get interrupted
-        if event.wait(1):
-            break
-        if timeout is not None:
-            timeout -= 1
-            if timeout < 0:
+        # this loop allows the thread to get interrupted
+        wait_time = 1
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                with lock:
+                    if state["done"]:
+                        break
+                    state["cancelled"] = True
+                future.cancel()
                 raise FSTimeoutError
+            wait_time = min(wait_time, remaining)
+        if event.wait(wait_time):
+            break
 
     return_result = result[0]
     # the traceback of a stored exception includes _runner's frame, which holds
@@ -387,6 +427,12 @@ async def _run_coros_in_chunks(
     nofiles: bool
         If inferring the batch_size, does this operation involve local files?
         If yes, you normally expect smaller batches.
+
+    Notes
+    -----
+    If the caller cancels, all in-flight tasks are cancelled and awaited before
+    the cancellation propagates; coroutines that were never submitted are
+    closed. Cancellation itself is never returned as an item exception.
     """
 
     if batch_size is None:
@@ -412,36 +458,48 @@ async def _run_coros_in_chunks(
     results = [None] * n
     pending = set()
 
-    while pending or i < n:
-        while len(pending) < batch_size and i < n:
-            pending.add(asyncio.ensure_future(_run_coro(coros[i], i)))
-            i += 1
+    try:
+        while pending or i < n:
+            while len(pending) < batch_size and i < n:
+                pending.add(asyncio.ensure_future(_run_coro(coros[i], i)))
+                i += 1
 
-        if not pending:
-            break
+            if not pending:
+                break
 
-        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-        first_exc = None
-        while done:
-            task = done.pop()
-            try:
-                result, k = await task
-                results[k] = result
-            except Exception as exc:
-                if first_exc is None:
-                    first_exc = exc
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            first_exc = None
+            while done:
+                task = done.pop()
+                try:
+                    result, k = await task
+                    results[k] = result
+                except Exception as exc:
+                    if first_exc is None:
+                        first_exc = exc
 
-        if first_exc is not None:
-            for task in pending:
-                task.cancel()
+            if first_exc is not None:
+                try:
+                    raise first_exc
+                finally:
+                    # the traceback includes this frame, so it must not refer back
+                    # to the exception: directly or through the finished task
+                    del first_exc, task
+    except (Exception, asyncio.CancelledError):
+        for task in pending:
+            task.cancel()
+        try:
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
-            try:
-                raise first_exc
-            finally:
-                # the traceback includes this frame, so it must not refer back
-                # to the exception: directly or through the finished task
-                del first_exc, task
+        finally:
+            # Coroutines that never reached a task must not be left to warn at
+            # garbage-collection time; completed coroutines accept close().
+            for coro in coros:
+                if inspect.iscoroutine(coro):
+                    coro.close()
+        raise
 
     return results
 

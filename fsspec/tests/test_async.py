@@ -10,6 +10,7 @@ import threading
 import time
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +18,27 @@ import pytest
 import fsspec
 import fsspec.asyn
 from fsspec.asyn import _run_coros_in_chunks
+
+
+@contextmanager
+def _running_loop():
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever)
+    thread.start()
+    try:
+        yield loop
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5)
+        loop.close()
+
+
+def _active_tasks(loop):
+    async def count_tasks():
+        current = asyncio.current_task()
+        return [task for task in asyncio.all_tasks(loop) if task is not current]
+
+    return fsspec.asyn.sync(loop, count_tasks)
 
 
 def test_get_lock_is_thread_safe(monkeypatch):
@@ -304,6 +326,104 @@ def test_sync_wrapper_bad_multiple_sync():
         test_obj.bad_multiple_sync_func(timeout=5)
 
 
+def test_sync_timeout_cancels_only_target_and_keeps_loop_usable():
+    target_started = threading.Event()
+    target_cancelled = threading.Event()
+    other_started = threading.Event()
+    release_other = threading.Event()
+
+    async def target():
+        target_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            target_cancelled.set()
+            raise
+
+    async def other_operation():
+        other_started.set()
+        await asyncio.to_thread(release_other.wait)
+        return "other"
+
+    with _running_loop() as loop:
+        other_future = asyncio.run_coroutine_threadsafe(other_operation(), loop)
+        assert other_started.wait(timeout=1)
+
+        with pytest.raises(fsspec.FSTimeoutError):
+            fsspec.asyn.sync(loop, target, timeout=0.05)
+
+        assert target_cancelled.wait(timeout=1)
+        fsspec.asyn.sync(loop, asyncio.sleep, 0, timeout=1)
+        assert len(_active_tasks(loop)) == 1
+        assert not other_future.done()
+        assert loop.is_running()
+        assert not loop.is_closed()
+
+        release_other.set()
+        assert other_future.result(timeout=1) == "other"
+        assert fsspec.asyn.sync(loop, asyncio.sleep, 0, timeout=1) is None
+        assert _active_tasks(loop) == []
+
+
+def test_sync_timeout_does_not_allow_late_result_write(monkeypatch):
+    target_started = threading.Event()
+    target_finished = threading.Event()
+    writes = []
+    real_store_result = fsspec.asyn._store_result
+
+    def recording_store_result(result, value, state=None, lock=None):
+        real_store_result(result, value, state, lock)
+        if result[0] is not None:
+            writes.append(result[0])
+
+    monkeypatch.setattr(fsspec.asyn, "_store_result", recording_store_result)
+
+    async def target():
+        target_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.02)
+            target_finished.set()
+            return "late"
+
+    with _running_loop() as loop:
+        with pytest.raises(fsspec.FSTimeoutError):
+            fsspec.asyn.sync(loop, target, timeout=0.05)
+        assert target_started.wait(timeout=1)
+        assert target_finished.wait(timeout=1)
+        assert writes == []
+        monkeypatch.undo()
+        assert fsspec.asyn.sync(loop, asyncio.sleep, 0, timeout=1) is None
+
+
+def test_sync_closed_loop_raises_runtimeerror():
+    loop = asyncio.new_event_loop()
+    loop.close()
+
+    async def unused():
+        pytest.fail("work was scheduled on a closed loop")
+
+    with pytest.raises(RuntimeError, match="Loop is not running"):
+        fsspec.asyn.sync(loop, unused)
+
+
+def test_sync_scheduling_runtime_error_closes_coroutines(monkeypatch):
+    def fail_scheduling(coro, loop):
+        raise RuntimeError("closed while scheduling")
+
+    monkeypatch.setattr(
+        fsspec.asyn.asyncio, "run_coroutine_threadsafe", fail_scheduling
+    )
+
+    async def unused():
+        pytest.fail("work was scheduled on a closed loop")
+
+    with _running_loop() as loop:
+        with pytest.raises(RuntimeError, match="closed while scheduling"):
+            fsspec.asyn.sync(loop, unused)
+
+
 def test_run_coros_in_chunks(monkeypatch):
     total_running = 0
 
@@ -345,6 +465,71 @@ def test_run_coros_in_chunks(monkeypatch):
 
     monkeypatch.setitem(fsspec.config.conf, "gather_batch_size", 4)
     assert sum(asyncio.run(main())) == 32  # override
+
+
+@pytest.mark.asyncio
+async def test_run_coros_in_chunks_cancel_cleans_tasks_and_slots():
+    running = 0
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    second_cancelled = asyncio.Event()
+    first_release = asyncio.Event()
+    third_started = asyncio.Event()
+
+    async def gated(index, started, wait_event=None):
+        nonlocal running
+        running += 1
+        try:
+            started.set()
+            if wait_event is not None:
+                await wait_event.wait()
+            return index
+        finally:
+            running -= 1
+
+    async def second():
+        nonlocal running
+        running += 1
+        try:
+            second_started.set()
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            second_cancelled.set()
+            raise
+        finally:
+            running -= 1
+
+    async def third():
+        third_started.set()
+
+    batch = asyncio.create_task(
+        _run_coros_in_chunks(
+            [
+                gated(0, first_started, first_release),
+                second(),
+                third(),
+            ],
+            batch_size=2,
+            return_exceptions=True,
+        )
+    )
+    await asyncio.gather(first_started.wait(), second_started.wait())
+    first_release.set()
+    batch.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await batch
+
+    await asyncio.wait_for(second_cancelled.wait(), timeout=1)
+    assert running == 0
+    assert not third_started.is_set()
+    current = asyncio.current_task()
+    assert all(
+        task.done()
+        for task in asyncio.all_tasks()
+        if task is not current and task is not batch
+    )
+    assert await _run_coros_in_chunks([gated(3, asyncio.Event())], batch_size=1) == [3]
 
 
 def test_running_async():
@@ -528,6 +713,108 @@ def test_cat_ranges_on_error_raise_propagates():
     fs = _CatRangesFS()
     with pytest.raises(FileNotFoundError):
         fs.cat_ranges(["ok", "missing"], [0, 0], [4, 4], on_error="raise")
+
+
+class _BarrierRangesFS(fsspec.asyn.AsyncFileSystem):
+    protocol = "barrierranges"
+    cachable = False
+
+    def __init__(self, *, loop=None, failures=(), **kwargs):
+        super().__init__(loop=loop, **kwargs)
+        self.failures = set(failures)
+        self.started = {}
+        self.releases = {}
+        self.cancelled = {}
+
+    def add_range(self, path):
+        self.started[path] = threading.Event()
+        self.releases[path] = asyncio.Event()
+        self.cancelled[path] = threading.Event()
+
+    async def _cat_file(self, path, start=None, end=None, **kwargs):
+        self.started[path].set()
+        try:
+            await self.releases[path].wait()
+        except asyncio.CancelledError:
+            self.cancelled[path].set()
+            raise
+        if path in self.failures:
+            raise ValueError(path)
+        return f"{path}:{start}:{end}".encode()
+
+
+@pytest.mark.asyncio
+async def test_cat_ranges_cancel_propagates_and_leaves_next_batch_usable():
+    fs = _BarrierRangesFS(asynchronous=True)
+    for path in ("a", "b", "c"):
+        fs.add_range(path)
+
+    batch = asyncio.create_task(
+        fs._cat_ranges(
+            ["a", "b", "c"],
+            [0, 1, 2],
+            [3, 4, 5],
+            batch_size=2,
+            on_error="raise",
+        )
+    )
+    assert await asyncio.to_thread(fs.started["a"].wait, 1)
+    assert await asyncio.to_thread(fs.started["b"].wait, 1)
+    batch.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await batch
+
+    assert await asyncio.to_thread(fs.cancelled["a"].wait, 1)
+    assert await asyncio.to_thread(fs.cancelled["b"].wait, 1)
+    assert not fs.started["c"].is_set()
+    current = asyncio.current_task()
+    assert all(
+        task.done()
+        for task in asyncio.all_tasks()
+        if task is not current and task is not batch
+    )
+
+    for path in ("d", "e"):
+        fs.add_range(path)
+        fs.releases[path].set()
+    assert await fs._cat_ranges(["d", "e"], [0, 1], [2, 3], batch_size=1) == [
+        b"d:0:2",
+        b"e:1:3",
+    ]
+
+
+def test_cat_ranges_sync_timeout_distinguishes_item_failure_and_closed_loop():
+    with _running_loop() as loop:
+        fs = _BarrierRangesFS(loop=loop, failures=["bad"])
+        for path in ("ok", "bad", "later"):
+            fs.add_range(path)
+
+        with pytest.raises(fsspec.FSTimeoutError):
+            fs.cat_ranges(["ok", "bad"], [0, 1], [2, 3], timeout=0.05)
+
+        assert fs.started["ok"].wait(timeout=1)
+        assert fs.started["bad"].wait(timeout=1)
+        assert fs.cancelled["ok"].wait(timeout=1)
+        assert fs.cancelled["bad"].wait(timeout=1)
+        assert not fs.started["later"].is_set()
+        assert loop.is_running()
+        assert not loop.is_closed()
+
+        for path in ("ok", "bad", "later"):
+            loop.call_soon_threadsafe(fs.releases[path].set)
+        out = fs.cat_ranges(
+            ["ok", "bad", "later"], [0, 1, 2], [2, 3, 4], on_error="return"
+        )
+        assert out[0] == b"ok:0:2"
+        assert isinstance(out[1], ValueError)
+        assert out[2] == b"later:2:4"
+
+    closed_loop = asyncio.new_event_loop()
+    closed_loop.close()
+    closed_fs = _BarrierRangesFS(loop=closed_loop)
+    with pytest.raises(RuntimeError, match="Loop is not running"):
+        closed_fs.cat_ranges(["never"], [0], [1])
 
 
 # ---------------------------------------------------------------------------
