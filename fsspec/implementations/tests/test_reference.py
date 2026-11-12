@@ -6,12 +6,70 @@ import pytest
 
 import fsspec
 from fsspec.implementations.local import LocalFileSystem
+from fsspec.implementations.memory import MemoryFileSystem
 from fsspec.implementations.reference import (
     LazyReferenceMapper,
     ReferenceFileSystem,
     ReferenceNotReachable,
+    ReferenceResolutionError,
 )
 from fsspec.tests.conftest import data, reset_files, server, win  # noqa: F401
+
+
+class LoggingMemoryFileSystem(MemoryFileSystem):
+    """Memory filesystem recording every range handed to the target FS."""
+
+    protocol = "memory"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.read_log = []
+
+    def cat_file(self, path, start=None, end=None, **kwargs):
+        self.read_log.append((self._strip_protocol(path), start, end))
+        return super().cat_file(path, start, end, **kwargs)
+
+    def cat_ranges(self, paths, starts, ends, *args, **kwargs):
+        for path, start, end in zip(paths, starts, ends):
+            self.read_log.append((self._strip_protocol(path), start, end))
+        # bypass the overridden cat_file so each range is logged once
+        return [
+            MemoryFileSystem.cat_file(self, path, start, end)
+            for path, start, end in zip(paths, starts, ends)
+        ]
+
+
+class ShortReadMemoryFileSystem(MemoryFileSystem):
+    """Returns every requested range two bytes short."""
+
+    protocol = "memory"
+
+    def cat_ranges(self, paths, starts, ends, *args, **kwargs):
+        return [
+            super(ShortReadMemoryFileSystem, self).cat_file(p, s, e)[:-2]
+            for p, s, e in zip(paths, starts, ends)
+        ]
+
+
+def _segment_refs(remote):
+    return {
+        "logical": [
+            ["memory://a", 1, 3],
+            {"inline": b"AB"},
+            {"zeros": 4},
+            ["memory://b", 2, 3],
+            ["memory://a", 7, 2],
+        ],
+        "only_inline": [{"inline": b"local"}, {"zeros": 2}, {"inline": b"XY"}],
+        "legacy_range": ["memory://a", 0, 5],
+        "legacy_inline": b"legacy",
+        "remote": remote,
+    }
+
+
+def _expected_logical():
+    return b"123" + b"AB" + b"\x00" * 4 + b"cde" + b"78"
+
 
 
 def test_simple(server):
@@ -1162,3 +1220,299 @@ def test_no_default_jinja_execution():
 
     with pytest.raises(ZeroDivisionError):
         fsspec.filesystem("reference", fo=manifest, simple_templates=False)
+
+
+def _multi_segment_fs(m):
+    m.pipe("/a", b"0123456789")
+    m.pipe("/b", b"abcdef")
+    m.pipe("/short", b"abc")
+    fs = fsspec.filesystem(
+        "reference", fo=_segment_refs("memory://a"), fs=m, skip_instance_cache=True
+    )
+    return fs
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        (None, None),
+        (0, 3),
+        (2, 2),
+        (1, -1),
+        (-5, None),
+        (5, 11),
+        (0, 2),
+        (11, 20),
+        (100, None),
+        (None, -100),
+        (-100, -90),
+        (3, 4),
+    ],
+)
+def test_multi_segment_reads_match_direct_concatenation(m, start, end):
+    fs = _multi_segment_fs(m)
+    expected = _expected_logical()
+
+    assert fs.cat_file("logical", start=start, end=end) == expected[start:end]
+    # batch reads work over the same logical coordinates
+    if start is None and end is None:
+        assert fs.cat(["logical"])["logical"] == expected
+
+
+def test_multi_segment_open_seek_read(m):
+    fs = _multi_segment_fs(m)
+    expected = _expected_logical()
+
+    with fs.open("logical", "rb") as f:
+        assert f.read(3) == expected[:3]
+        f.seek(3)
+        assert f.read() == expected[3:]
+        f.seek(5)
+        assert f.read(4) == expected[5:9]
+        f.seek(0)
+        assert f.read(20) == expected
+        assert not f.read()
+        f.seek(-3, 2)
+        assert f.read() == expected[-3:]
+        # read() above moved the position to the end (the logical length)
+        assert f.seek(2, 1) == len(expected) + 2
+        assert f.read(1) == b""
+
+
+def test_multi_segment_batch_cat_matches_concatenation(m):
+    fs = _multi_segment_fs(m)
+    out = fs.cat(["logical", "only_inline", "legacy_range", "legacy_inline"])
+    assert out == {
+        "logical": _expected_logical(),
+        "only_inline": b"local\x00\x00XY",
+        "legacy_range": b"01234",
+        "legacy_inline": b"legacy",
+    }
+
+
+def test_single_range_and_segment_forms_coexist(m):
+    fs = _multi_segment_fs(m)
+    # legacy forms are untouched
+    assert fs.cat_file("legacy_range") == b"01234"
+    assert fs.cat_file("legacy_range", 1, 4) == b"123"
+    assert fs.cat_file("legacy_inline") == b"legacy"
+    # a single-range reference still reads as before and appears in listings
+    assert fs.find("") == [
+        "legacy_inline",
+        "legacy_range",
+        "logical",
+        "only_inline",
+        "remote",
+    ]
+    assert fs.size("logical") == len(_expected_logical())
+    assert fs.size("only_inline") == 9
+    assert fs.size("legacy_range") == 5
+    assert fs.info("logical") == {
+        "name": "logical",
+        "type": "file",
+        "size": len(_expected_logical()),
+    }
+    assert {e["name"]: e["size"] for e in fs.ls("", detail=True)} == {
+        "legacy_inline": 6,
+        "legacy_range": 5,
+        "logical": len(_expected_logical()),
+        "only_inline": 9,
+        "remote": 10,
+    }
+
+
+def test_multi_segment_fetches_only_needed_ranges(m):
+    other = LoggingMemoryFileSystem()
+    other.pipe("/big", bytes(range(256)) * 4)
+    big = bytes(range(256)) * 4
+    refs = {
+        "sparse": [["memory://big", 10, 5], ["memory://big", 500, 5]],
+        "mixed": [
+            ["memory://big", 0, 4],
+            {"inline": b"AB"},
+            {"zeros": 3},
+            ["memory://big", 100, 4],
+        ],
+        "adjacent": [["memory://big", 10, 5], ["memory://big", 15, 5]],
+    }
+    fs = fsspec.filesystem(
+        "reference", fo=refs, fs=other, skip_instance_cache=True, max_gap=0
+    )
+
+    other.read_log.clear()
+    assert fs.cat_file("sparse") == big[10:15] + big[500:505]
+    assert other.read_log == [("/big", 10, 15), ("/big", 500, 505)]
+    # exactly ten bytes were requested: no gap or unrelated content
+    assert sum(end - start for _, start, end in other.read_log) == 10
+
+    other.read_log.clear()
+    assert fs.cat_file("mixed") == big[0:4] + b"AB" + b"\x00" * 3 + big[100:104]
+    assert other.read_log == [("/big", 0, 4), ("/big", 100, 104)]
+
+    # touching ranges are merged into one read, same result
+    other.read_log.clear()
+    assert fs.cat_file("adjacent") == big[10:20]
+    assert other.read_log == [("/big", 10, 20)]
+
+    # a wider merge window changes requests, not results
+    wide = fsspec.filesystem(
+        "reference", fo=refs, fs=other, skip_instance_cache=True, max_gap=64_000
+    )
+    other.read_log.clear()
+    assert wide.cat_file("sparse") == big[10:15] + big[500:505]
+    assert wide.cat_file("mixed") == big[0:4] + b"AB" + b"\x00" * 3 + big[100:104]
+
+
+def test_multi_segment_batch_only_reads_needed_ranges(m):
+    other = LoggingMemoryFileSystem()
+    other.pipe("/big", bytes(range(256)) * 4)
+    big = bytes(range(256)) * 4
+    refs = {
+        "one": [["memory://big", 10, 5], ["memory://big", 500, 5]],
+        "two": [["memory://big", 300, 3]],
+        "three": [["memory://big", 0, 4], {"zeros": 3}, ["memory://big", 100, 4]],
+    }
+    fs = fsspec.filesystem(
+        "reference", fo=refs, fs=other, skip_instance_cache=True, max_gap=0
+    )
+    other.read_log.clear()
+    out = fs.cat(["one", "two", "three"])
+    assert out["one"] == big[10:15] + big[500:505]
+    assert out["two"] == big[300:303]
+    assert out["three"] == big[0:4] + b"\x00" * 3 + big[100:104]
+    assert sorted(other.read_log) == [
+        ("/big", 0, 4),
+        ("/big", 10, 15),
+        ("/big", 100, 104),
+        ("/big", 300, 303),
+        ("/big", 500, 505),
+    ]
+
+
+def test_multi_segment_short_read_is_not_silently_shifted(m):
+    m.pipe("/a", b"0123456789")
+    short = ShortReadMemoryFileSystem()
+    short.pipe("/a", b"0123456789")
+    fs = fsspec.filesystem(
+        "reference",
+        fo={"f": [["memory://a", 0, 5], ["memory://a", 5, 5]]},
+        fs=short,
+        skip_instance_cache=True,
+    )
+    with pytest.raises(ReferenceNotReachable):
+        fs.cat_file("f")
+    with pytest.raises(ReferenceNotReachable):
+        fs.cat("f")
+    with pytest.raises(ReferenceNotReachable):
+        with fs.open("f", "rb") as f:
+            f.read()
+
+
+def test_multi_segment_unknown_length_has_clear_rules(m):
+    fs = _multi_segment_fs(m)
+    # a whole-file segment can still be read when no bounded window is needed
+    refs = {"whole": [["memory://a"], {"zeros": 3}]}
+    fs = fsspec.filesystem(
+        "reference", fo=refs, fs=m, skip_instance_cache=True
+    )
+    assert fs.cat_file("whole") == b"0123456789" + b"\x00" * 3
+
+    with pytest.raises(ReferenceResolutionError):
+        fs.size("whole")
+    with pytest.raises(ReferenceResolutionError):
+        fs.info("whole")
+    with pytest.raises(ReferenceResolutionError):
+        fs.open("whole", "rb")
+    with pytest.raises(ReferenceResolutionError):
+        fs.cat_file("whole", 1, 4)
+
+
+def test_multi_segment_nested_references_and_cycles(m):
+    fs = _multi_segment_fs(m)
+    m.pipe("/a", b"0123456789")
+    refs = {
+        "base": [["memory://a", 0, 5], {"zeros": 2}],
+        "nested": [["reference://base", 1, 4], {"inline": b"Z"}],
+        "nested_whole": [["reference://base"]],
+        "cycle_a": [["reference://cycle_b"]],
+        "cycle_b": [["reference://cycle_a"]],
+    }
+    fs = fsspec.filesystem(
+        "reference", fo=refs, fs=m, skip_instance_cache=True
+    )
+    assert fs.cat_file("nested") == b"1234Z"
+    assert fs.cat_file("nested", 0, 3) == b"123"
+    assert fs.cat_file("nested_whole") == b"01234\x00\x00"
+
+    with pytest.raises(ReferenceResolutionError, match="cycle"):
+        fs.cat_file("cycle_a")
+
+    # a nested range that reaches past the nested logical length is rejected
+    refs2 = {"base": [["memory://a", 0, 3]], "bad": [["reference://base", 2, 5]]}
+    fs2 = fsspec.filesystem(
+        "reference", fo=refs2, fs=m, skip_instance_cache=True
+    )
+    with pytest.raises(ReferenceResolutionError):
+        fs2.cat_file("bad")
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        [[123]],
+        [{"weird": 1}],
+        [{"zeros": -1}],
+        [{"zeros": True}],
+        [{"zeros": 2.5}],
+        [{"inline": 42}],
+        [["memory://a", -1, 2]],
+        [["memory://a", 0, 1, 2]],
+        [["memory://a", 1, 2], 5],
+    ],
+)
+def test_multi_segment_invalid_descriptor_is_rejected(m, ref):
+    m.pipe("/a", b"0123456789")
+    fs = fsspec.filesystem(
+        "reference", fo={"f": ref}, fs=m, skip_instance_cache=True
+    )
+    with pytest.raises(ReferenceResolutionError):
+        fs.cat_file("f")
+
+
+def test_multi_segment_bad_reference_path_reports_out_of_bounds(m):
+    m.pipe("/a", b"0123456789")
+    fs = fsspec.filesystem(
+        "reference", fo={"f": [["memory://a", 0, 5]]}, fs=m, skip_instance_cache=True
+    )
+    # logical windows are clamped like slicing, never reaching outside the part
+    assert fs.cat_file("f", 2, 100) == b"234"
+    assert fs.cat_file("f", -100) == b"01234"
+    assert fs.cat_file("f", 100) == b""
+    assert fs.cat_file("f", 0, -100) == b""
+
+
+def test_multi_segment_missing_target(m):
+    fs = fsspec.filesystem(
+        "reference",
+        fo={"f": [["memory://missing", 0, 3]]},
+        fs=m,
+        skip_instance_cache=True,
+    )
+    with pytest.raises(ReferenceNotReachable):
+        fs.cat_file("f")
+    assert isinstance(fs.cat("f", on_error="return"), ReferenceNotReachable)
+
+
+@pytest.mark.asyncio
+async def test_multi_segment_async_cat_file(m):
+    m.pipe("/a", b"0123456789")
+    m.pipe("/b", b"abcdef")
+    refs = _segment_refs("memory://a")
+    fs = fsspec.filesystem(
+        "reference", fo=refs, fs=m, skip_instance_cache=True, asynchronous=True
+    )
+
+    assert await fs._cat_file("logical", start=1, end=9) == _expected_logical()[1:9]
+    assert await fs._cat_file("logical") == _expected_logical()
+    assert await fs._cat_file("logical", start=-3) == _expected_logical()[-3:]
+

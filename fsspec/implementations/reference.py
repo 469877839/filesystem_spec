@@ -42,6 +42,20 @@ class ReferenceNotReachable(RuntimeError):
         return f'Reference "{self.reference}" failed to fetch target {self.target}'
 
 
+class ReferenceResolutionError(ValueError):
+    """A reference is malformed or cannot be resolved to readable bytes.
+
+    Raised for unknown segment types, out-of-range coordinates, references
+    whose logical length cannot be determined, nested references that do not
+    resolve to a bounded length, and reference cycles.
+    """
+
+
+# A remote segment that is not allowed to contain a reference cycle may
+# traverse at most this many ``reference://`` hops before giving up.
+MAX_REFERENCE_HOPS = 64
+
+
 def _first(d):
     return next(iter(d.values()))
 
@@ -74,6 +88,196 @@ def _decode_inline(part):
     if part.startswith(b"base64:"):
         return base64.b64decode(part[7:])
     return part
+
+
+# Normalized segments are tuples tagged by kind:
+#   ("inline", data_bytes)
+#   ("zeros", length)
+#   ("range", url, offset, length)   length is None for a whole-file segment
+def _is_multi_segment(part):
+    """Whether a reference value uses the ordered-segment form.
+
+    The legacy forms stay flat: inline bytes/strings, ``[url]`` and
+    ``[url, offset, size]``, whose elements are all scalars. A reference
+    containing any list/tuple/dict element is treated as ordered segments
+    (remote parts or ``{"inline": ...}`` / ``{"zeros": n}`` dicts); mixed
+    content then fails validation with a clear error.
+    """
+    if not isinstance(part, (list, tuple)) or not part:
+        return False
+    return any(isinstance(seg, (list, tuple, dict)) for seg in part)
+
+
+def _normalize_segment(segment, path=None):
+    """Validate one segment and return its tagged, normalized tuple."""
+    if isinstance(segment, dict):
+        if "inline" in segment:
+            value = segment["inline"]
+            if isinstance(value, (str, bytes)):
+                return ("inline", _inline_data(value))
+            if hasattr(value, "to_bytes") and not isinstance(
+                value, (int, float, bool)
+            ):
+                # e.g. numpy scalars, matching legacy inline references
+                return ("inline", _inline_data(value))
+            raise ReferenceResolutionError(
+                f"Inline segment for {path!r} must hold str or bytes, "
+                f"got {type(value).__name__}"
+            )
+        if "zeros" in segment:
+            length = segment["zeros"]
+            if not isinstance(length, int) or isinstance(length, bool) or length < 0:
+                raise ReferenceResolutionError(
+                    f"Zero-fill segment for {path!r} needs a non-negative integer "
+                    f"length, got {length!r}"
+                )
+            return ("zeros", length)
+        raise ReferenceResolutionError(
+            f"Unknown dict segment for {path!r}: expected 'inline' or 'zeros', "
+            f"got {sorted(segment)}"
+        )
+    if isinstance(segment, (list, tuple)):
+        if not segment or not (
+            segment[0] is None or isinstance(segment[0], str)
+        ):
+            raise ReferenceResolutionError(
+                f"Remote segment for {path!r} must start with a URL string, "
+                f"got {segment!r}"
+            )
+        url = segment[0]
+        if len(segment) == 1:
+            return ("range", url, 0, None)
+        if len(segment) == 3:
+            offset, length = segment[1], segment[2]
+            if (
+                not isinstance(offset, int)
+                or isinstance(offset, bool)
+                or not isinstance(length, int)
+                or isinstance(length, bool)
+                or offset < 0
+                or length < 0
+            ):
+                raise ReferenceResolutionError(
+                    f"Remote range segment for {path!r} needs non-negative "
+                    f"integer offset and length, got {segment!r}"
+                )
+            return ("range", url, offset, length)
+        raise ReferenceResolutionError(
+            f"Remote segment for {path!r} must be [url] or [url, offset, length], "
+            f"got {segment!r}"
+        )
+    raise ReferenceResolutionError(
+        f"Unsupported segment for {path!r}: {segment!r}"
+    )
+
+
+def _normalize_segments(part, path=None):
+    """Validate a multi-segment reference and return normalized segments."""
+    return [_normalize_segment(segment, path) for segment in part]
+
+
+def _segment_length(segment):
+    """Logical length of one normalized segment, or None if unknown."""
+    kind = segment[0]
+    if kind == "inline":
+        return len(segment[1])
+    if kind == "range":
+        return segment[3]
+    return segment[1]  # zeros
+
+
+def _known_length(segments):
+    """Total logical length when every segment is bounded, else None."""
+    total = 0
+    for segment in segments:
+        length = _segment_length(segment)
+        if length is None:
+            return None
+        total += length
+    return total
+
+
+def _extract_ranges(urls, starts, ends, merged_paths, merged_starts, merged_ends, data):
+    """Pull each requested range back out of merged fetch results.
+
+    Merging only widens requests, so every requested range is covered by at
+    least one returned block; the returned bytes are sliced back to the
+    original coordinates. Exceptions in ``data`` are passed through.
+    """
+    out = []
+    for url, start, end in zip(urls, starts, ends):
+        for mpath, mstart, mend, chunk in zip(
+            merged_paths, merged_starts, merged_ends, data
+        ):
+            if mpath != url:
+                continue
+            if mend is None:
+                covers = mstart <= start
+            else:
+                covers = mstart <= start and (end is not None and end <= mend)
+            if not covers:
+                continue
+            if isinstance(chunk, Exception):
+                out.append(chunk)
+            elif end is None:
+                out.append(chunk[start - mstart :])
+            else:
+                out.append(chunk[start - mstart : end - mstart])
+            break
+        else:
+            raise ReferenceResolutionError(
+                f"Merged fetch did not cover range [{start}, {end}) of {url!r}"
+            )
+    return out
+
+
+def _slice_segments(segments, start, end):
+    """Intersect a logical [start, end) window with normalized segments.
+
+    Coordinates follow Python slicing against the known logical length, so
+    out-of-range windows are clamped rather than reaching past the reference.
+    Returns a list of ``(segment, local_start, local_end)`` where the local
+    offsets are relative to that segment and ``local_end`` may be None for a
+    whole-file segment that extends to the end of the file.
+    """
+    length = _known_length(segments)
+    if length is None:
+        if start is None and end is None:
+            # Unbounded read: every segment contributes its full extent, whose
+            # end is exactly what the remote returns for a whole-file segment.
+            return [(segment, 0, _segment_length(segment)) for segment in segments]
+        raise ReferenceResolutionError(
+            "Cannot compute bounded logical coordinates: a segment has unknown "
+            "length"
+        )
+    if start is None:
+        start = 0
+    if end is None:
+        end = length
+    if start < 0:
+        start = max(length + start, 0)
+    if end < 0:
+        end = max(length + end, 0)
+    start = min(start, length)
+    end = min(end, length)
+    if end <= start:
+        return []
+
+    plan = []
+    cursor = 0
+    for segment in segments:
+        seg_length = _segment_length(segment)
+        seg_end = cursor + seg_length
+        if seg_end <= start:
+            cursor = seg_end
+            continue
+        if cursor >= end:
+            break
+        local_start = max(start - cursor, 0)
+        local_end = min(end - cursor, seg_length)
+        plan.append((segment, local_start, local_end))
+        cursor = seg_end
+    return plan
 
 
 def _prot_in_references(path, references):
@@ -647,6 +851,19 @@ class ReferenceFileSystem(AsyncFileSystem):
     {path0: bytes_data, path1: (target_url, offset, size)}
     https://github.com/fsspec/kerchunk/blob/main/README.md
 
+    A path may also be described as an ordered list of segments, forming one
+    logical file by concatenation. Each segment is one of:
+
+    - ``[url]`` or ``[url, offset, size]``: bytes from a remote file (a
+      whole-file segment has unknown length until read, so such a file
+      cannot be opened for random access or sized)
+    - ``{"inline": data}``: literal bytes (str, bytes or ``base64:``-encoded)
+    - ``{"zeros": n}``: ``n`` zero bytes
+
+    A remote URL of the form ``reference://path`` resolves to another
+    reference in this same set; cycles are rejected. The legacy flat forms
+    (inline data, ``[url]``, ``[url, offset, size]``) are unchanged.
+
     simple_references: if True (default), no jinja interpreting is done,
         which is the safe option.
     """
@@ -817,6 +1034,185 @@ class ReferenceFileSystem(AsyncFileSystem):
                     "of asynchronous"
                 )
 
+    def _resolve_segments(self, path, _chain=()):
+        """Resolve a path to normalized, non-nested segments.
+
+        Returns a list of tagged segments (see ``_normalize_segment``) in
+        which every remote URL points at a real target: ``reference://``
+        URLs are followed into this same reference set, and legacy
+        single-range references are rewritten as one remote segment.
+        """
+        path = self._strip_protocol(path)
+        if path in _chain:
+            raise ReferenceResolutionError(
+                f"Reference cycle: {' -> '.join([*_chain, path])}"
+            )
+        if len(_chain) >= MAX_REFERENCE_HOPS:
+            raise ReferenceResolutionError(
+                f"Reference chain longer than {MAX_REFERENCE_HOPS} hops at {path!r}"
+            )
+        try:
+            part = self.references[path]
+        except KeyError as exc:
+            raise FileNotFoundError(path) from exc
+        if isinstance(part, str):
+            part = part.encode()
+        if hasattr(part, "to_bytes"):
+            part = part.to_bytes()
+        if isinstance(part, bytes):
+            return [("inline", _inline_data(part))]
+        if _is_multi_segment(part):
+            out = []
+            for segment in _normalize_segments(part, path):
+                out.extend(self._resolve_segment(segment, path, _chain))
+            return out
+        if len(part) == 1:
+            segment = ("range", part[0], 0, None)
+        else:
+            segment = ("range", part[0], part[1], part[2])
+        return self._resolve_segment(segment, path, _chain)
+
+    def _resolve_segment(self, segment, path, _chain):
+        """Expand one segment, following ``reference://`` URLs in place."""
+        if segment[0] != "range":
+            return [segment]
+        _, url, offset, length = segment
+        protocol, inner = split_protocol(url) if url else (None, None)
+        if protocol != "reference":
+            return [segment]
+        nested = self._resolve_segments(inner, (*_chain, path))
+        if length is None and offset == 0:
+            return nested
+        nested_length = _known_length(nested)
+        if nested_length is None:
+            raise ReferenceResolutionError(
+                f"Nested reference {url!r} in {path!r} has unknown length; "
+                "only whole nested references may be unbounded"
+            )
+        if offset > nested_length or offset + length > nested_length:
+            raise ReferenceResolutionError(
+                f"Nested range [{offset}, {offset + length}) of {url!r} in "
+                f"{path!r} exceeds its length {nested_length}"
+            )
+        return [
+            self._shift_segment(seg, local_start, local_end)
+            for seg, local_start, local_end in _slice_segments(
+                nested, offset, offset + length
+            )
+        ]
+
+    @staticmethod
+    def _shift_segment(segment, local_start, local_end):
+        """A copy of a normalized segment trimmed to a local window."""
+        kind = segment[0]
+        if kind == "inline":
+            return ("inline", segment[1][local_start:local_end])
+        if kind == "zeros":
+            return ("zeros", local_end - local_start)
+        _, url, offset, length = segment
+        if local_end is None:
+            return ("range", url, offset + local_start, None)
+        return ("range", url, offset + local_start, local_end - local_start)
+
+    def _segments_size(self, path):
+        """Logical length of a path, or None when it cannot be known."""
+        return _known_length(self._resolve_segments(path))
+
+    def _segment_requests(self, segments):
+        """Split segments into local pieces and grouped remote requests."""
+        pieces = [None] * len(segments)
+        by_protocol = {}
+        for i, segment in enumerate(segments):
+            kind = segment[0]
+            if kind == "inline":
+                pieces[i] = segment[1]
+            elif kind == "zeros":
+                pieces[i] = b"\x00" * segment[1]
+            else:
+                _, url, offset, length = segment
+                if url is None:
+                    url = self.target
+                protocol, _ = split_protocol(url)
+                by_protocol.setdefault(protocol, []).append(
+                    (i, url, offset, length)
+                )
+        return pieces, by_protocol
+
+    @staticmethod
+    def _place_fetched(pieces, entries, fetched):
+        """Validate fetched ranges and slot them into their piece positions.
+
+        A remote range that comes back short raises instead of silently
+        shifting the coordinates of later segments.
+        """
+        for (i, url, offset, length), data in zip(entries, fetched):
+            if isinstance(data, Exception):
+                raise ReferenceNotReachable(url, url) from data
+            if length is not None and len(data) != length:
+                raise ReferenceNotReachable(
+                    url,
+                    url,
+                    f"short read: expected {length} bytes, got {len(data)}",
+                )
+            pieces[i] = data
+
+    def _fetch_segments(self, segments, fetch):
+        """Fetch remote segments through a sync ``fetch`` and concatenate.
+
+        ``fetch`` takes ``(protocol, urls, starts, ends)`` and returns the
+        bytes for each range in order. Inline and zero-fill segments are
+        produced locally.
+        """
+        pieces, by_protocol = self._segment_requests(segments)
+        for protocol, entries in by_protocol.items():
+            urls = [entry[1] for entry in entries]
+            starts = [entry[2] for entry in entries]
+            ends = [
+                None if entry[3] is None else entry[2] + entry[3]
+                for entry in entries
+            ]
+            fetched = fetch(protocol, urls, starts, ends)
+            self._place_fetched(pieces, entries, fetched)
+        return b"".join(pieces)
+
+    async def _fetch_segments_async(self, segments, fetch):
+        """Async counterpart of :meth:`_fetch_segments`."""
+        pieces, by_protocol = self._segment_requests(segments)
+        for protocol, entries in by_protocol.items():
+            urls = [entry[1] for entry in entries]
+            starts = [entry[2] for entry in entries]
+            ends = [
+                None if entry[3] is None else entry[2] + entry[3]
+                for entry in entries
+            ]
+            fetched = await fetch(protocol, urls, starts, ends)
+            self._place_fetched(pieces, entries, fetched)
+        return b"".join(pieces)
+
+    def _merged_ranges(self, urls, starts, ends):
+        """Merge neighbouring ranges on the same underlying URL."""
+        return merge_offset_ranges(
+            list(urls),
+            list(starts),
+            list(ends),
+            sort=True,
+            max_gap=self.max_gap,
+            max_block=self.max_block,
+        )
+
+    def _fetch_ranges(self, protocol, urls, starts, ends):
+        """Fetch byte ranges from one underlying filesystem, merging neighbours."""
+        fs = self.fss[protocol]
+        merged = self._merged_ranges(urls, starts, ends)
+        data = fs.cat_ranges(*merged)
+        return _extract_ranges(urls, starts, ends, *merged, data)
+
+    async def _fetch_ranges_async(self, protocol, urls, starts, ends):
+        fs = self.fss[protocol]
+        merged = self._merged_ranges(urls, starts, ends)
+        data = await fs._cat_ranges(*merged)
+        return _extract_ranges(urls, starts, ends, *merged, data)
+
     def _cat_common(self, path, start=None, end=None):
         path = self._strip_protocol(path)
         logger.debug(f"cat: {path}")
@@ -861,7 +1257,34 @@ class ReferenceFileSystem(AsyncFileSystem):
             url = self.target
         return url, start1, end1
 
+    def _cat_multi(self, path, start, end, fetch, segments=None):
+        """Assemble a multi-segment logical file over a logical window."""
+        if segments is None:
+            segments = self._resolve_segments(path)
+        plan = _slice_segments(segments, start, end)
+        shifted = [self._shift_segment(seg, s, e) for seg, s, e in plan]
+        try:
+            return self._fetch_segments(shifted, fetch)
+        except ReferenceNotReachable as exc:
+            raise ReferenceNotReachable(path, exc.target, *exc.args[2:]) from exc
+
+    async def _cat_multi_async(self, path, start, end, fetch, segments=None):
+        """Async counterpart of :meth:`_cat_multi`."""
+        if segments is None:
+            segments = self._resolve_segments(path)
+        plan = _slice_segments(segments, start, end)
+        shifted = [self._shift_segment(seg, s, e) for seg, s, e in plan]
+        try:
+            return await self._fetch_segments_async(shifted, fetch)
+        except ReferenceNotReachable as exc:
+            raise ReferenceNotReachable(path, exc.target, *exc.args[2:]) from exc
+
     async def _cat_file(self, path, start=None, end=None, **kwargs):
+        path = self._strip_protocol(path)
+        if _is_multi_segment(self.references.get(path)):
+            return await self._cat_multi_async(
+                path, start, end, self._fetch_ranges_async
+            )
         part_or_url, start0, end0 = self._cat_common(path, start=start, end=end)
         if isinstance(part_or_url, bytes):
             return part_or_url[start:end]
@@ -874,6 +1297,9 @@ class ReferenceFileSystem(AsyncFileSystem):
             raise ReferenceNotReachable(path, part_or_url) from e
 
     def cat_file(self, path, start=None, end=None, **kwargs):
+        path = self._strip_protocol(path)
+        if _is_multi_segment(self.references.get(path)):
+            return self._cat_multi(path, start, end, self._fetch_ranges)
         part_or_url, start0, end0 = self._cat_common(path, start=start, end=end)
         if isinstance(part_or_url, bytes):
             return part_or_url[start:end]
@@ -926,14 +1352,119 @@ class ReferenceFileSystem(AsyncFileSystem):
             if remote in data:
                 fs.pipe_file(local, data[remote])
 
+    def _cat_many_multi(self, paths, on_error):
+        """Batch-read multi-segment logical files with cross-file merging.
+
+        Remote segments from every logical file are collected per underlying
+        filesystem and fetched in one merged round trip, while inline and
+        zero-fill segments are produced locally. Returns ``(out, done)`` where
+        ``done`` names the paths already handled here (including any failures
+        recorded under ``on_error``).
+        """
+        out = {}
+        done = set()
+        per_file = {}
+        requests = {}
+        for path in paths:
+            path = self._strip_protocol(path)
+            done.add(path)
+            try:
+                segments = self._resolve_segments(path)
+                shifted = [
+                    self._shift_segment(seg, s, e)
+                    for seg, s, e in _slice_segments(segments, None, None)
+                ]
+            except (FileNotFoundError, ReferenceResolutionError) as exc:
+                if on_error == "raise":
+                    raise
+                if on_error != "omit":
+                    out[path] = exc
+                continue
+            pieces = [None] * len(shifted)
+            per_file[path] = pieces
+            for i, segment in enumerate(shifted):
+                kind = segment[0]
+                if kind == "inline":
+                    pieces[i] = segment[1]
+                elif kind == "zeros":
+                    pieces[i] = b"\x00" * segment[1]
+                else:
+                    _, url, offset, length = segment
+                    if url is None:
+                        url = self.target
+                    protocol, _ = split_protocol(url)
+                    requests.setdefault(protocol, []).append(
+                        (path, i, url, offset, length)
+                    )
+        for protocol, entries in requests.items():
+            urls = [entry[2] for entry in entries]
+            starts = [entry[3] for entry in entries]
+            ends = [
+                None if entry[4] is None else entry[3] + entry[4]
+                for entry in entries
+            ]
+            try:
+                fetched = self._fetch_ranges(protocol, urls, starts, ends)
+            except Exception as exc:
+                for path, _, _, _, _ in entries:
+                    wrapped = ReferenceNotReachable(path, protocol)
+                    wrapped.__cause__ = exc
+                    if on_error == "raise":
+                        raise wrapped
+                    if on_error != "omit":
+                        out.setdefault(path, wrapped)
+                continue
+            for (path, i, url, offset, length), data in zip(entries, fetched):
+                if path in out:
+                    continue
+                if isinstance(data, Exception):
+                    wrapped = ReferenceNotReachable(path, url)
+                    wrapped.__cause__ = data
+                    if on_error == "raise":
+                        raise wrapped
+                    if on_error != "omit":
+                        out[path] = wrapped
+                    continue
+                if length is not None and len(data) != length:
+                    wrapped = ReferenceNotReachable(
+                        path,
+                        url,
+                        f"short read: expected {length} bytes, got {len(data)}",
+                    )
+                    if on_error == "raise":
+                        raise wrapped
+                    if on_error != "omit":
+                        out[path] = wrapped
+                    continue
+                per_file[path][i] = data
+        for path, pieces in per_file.items():
+            if path not in out:
+                out[path] = b"".join(pieces)
+        return out, done
+
     def cat(self, path, recursive=False, on_error="raise", **kwargs):
         if isinstance(path, str) and recursive:
             raise NotImplementedError
         if isinstance(path, list) and (recursive or any("*" in p for p in path)):
             raise NotImplementedError
-        # TODO: if references is lazy, pre-fetch all paths in batch before access
-        proto_dict = _protocol_groups(path, self.references)
-        out = {}
+        # Multi-segment references flatten into per-segment remote requests and
+        # are assembled here, so they never reach the legacy single-range path.
+        if isinstance(path, str):
+            multi_paths = (
+                [path] if _is_multi_segment(self.references.get(path)) else []
+            )
+            single_paths = [] if multi_paths else [path]
+        else:
+            multi_paths = [
+                p for p in path if _is_multi_segment(self.references.get(p))
+            ]
+            single_paths = [p for p in path if p not in multi_paths]
+        out, multi_done = self._cat_many_multi(multi_paths, on_error)
+        if single_paths:
+            # TODO: if references is lazy, pre-fetch all paths in batch before access
+            proto_dict = _protocol_groups(single_paths, self.references)
+        else:
+            proto_dict = {}
         for proto, paths in proto_dict.items():
             fs = self.fss[proto]
             urls, starts, ends, valid_paths = [], [], [], []
@@ -1010,8 +1541,13 @@ class ReferenceFileSystem(AsyncFileSystem):
                             out[p] = b[s - ns : (e - ne) or None]
 
         for k, v in out.copy().items():
-            # these were valid references, but fetch failed, so transform exc
-            if isinstance(v, Exception) and k in self.references:
+            # these were valid references, but fetch failed, so transform exc.
+            # Multi-segment failures were already wrapped by _cat_many_multi.
+            if (
+                isinstance(v, Exception)
+                and k in self.references
+                and k not in multi_done
+            ):
                 ex = out[k]
                 new_ex = ReferenceNotReachable(k, self.references[k])
                 new_ex.__cause__ = ex
@@ -1022,7 +1558,12 @@ class ReferenceFileSystem(AsyncFileSystem):
                 else:
                     del out[k]
 
-        if len(out) == 1 and isinstance(path, str) and "*" not in path:
+        if (
+            len(out) == 1
+            and isinstance(path, str)
+            and "*" not in path
+            and not (on_error == "omit" and not out)
+        ):
             return _first(out)
         return out
 
@@ -1069,7 +1610,12 @@ class ReferenceFileSystem(AsyncFileSystem):
                 self.references[k] = v
             elif isinstance(v, dict):
                 self.references[k] = json.dumps(v)
-            elif self.templates:
+            elif self.templates and _is_multi_segment(v):
+                self.references[k] = [
+                    self._render_segment_template(segment, _render_jinja)
+                    for segment in v
+                ]
+            elif self.templates and isinstance(v[0], str):
                 u = v[0]
                 if "{{" in u:
                     if self.simple_templates:
@@ -1084,6 +1630,21 @@ class ReferenceFileSystem(AsyncFileSystem):
             else:
                 self.references[k] = v
         self.references.update(self._process_gen(references.get("gen", [])))
+
+    def _render_segment_template(self, segment, _render_jinja):
+        """Expand URL templates inside one segment; inline/zeros pass through."""
+        if not isinstance(segment, (list, tuple)) or not segment:
+            return segment
+        url = segment[0]
+        if not isinstance(url, str) or "{{" not in url:
+            return segment
+        if self.simple_templates:
+            url = url.replace("{{", "{").replace("}}", "}").format(
+                **self.templates
+            )
+        else:
+            url = _render_jinja(url)
+        return [url, *segment[1:]]
 
     def _process_templates(self, tmp):
         self.templates = {}
@@ -1158,6 +1719,8 @@ class ReferenceFileSystem(AsyncFileSystem):
         for path, part in it:
             if isinstance(part, (bytes, str)) or hasattr(part, "to_bytes"):
                 size = len(_inline_data(part))
+            elif _is_multi_segment(part):
+                size = _known_length(_normalize_segments(part, path))
             elif len(part) == 1:
                 size = None
             else:
@@ -1183,6 +1746,8 @@ class ReferenceFileSystem(AsyncFileSystem):
             self.dircache[par].append({"name": path, "type": "file", "size": size})
 
     def _open(self, path, mode="rb", block_size=None, cache_options=None, **kwargs):
+        if _is_multi_segment(self.references.get(self._strip_protocol(path))):
+            return MultiSegmentFile(self, path, mode, block_size=block_size)
         part_or_url, start0, end0 = self._cat_common(path)
         # This logic is kept outside `ReferenceFile` to avoid unnecessary redirection.
         # That does mean `_cat_common` gets called twice if it eventually reaches `ReferenceFile`.
@@ -1267,6 +1832,14 @@ class ReferenceFileSystem(AsyncFileSystem):
         if out is not None:
             if isinstance(out, (str, bytes)):
                 return {"name": path, "type": "file", "size": len(_inline_data(out))}
+            elif _is_multi_segment(out):
+                size = self._segments_size(path)
+                if size is None:
+                    raise ReferenceResolutionError(
+                        f"Size of {path!r} is unknown: it contains a whole-file "
+                        "segment with no bounded length"
+                    )
+                return {"name": path, "type": "file", "size": size}
             elif len(out) > 1:
                 return {"name": path, "type": "file", "size": out[2]}
             else:
@@ -1284,6 +1857,14 @@ class ReferenceFileSystem(AsyncFileSystem):
 
     async def _info(self, path, **kwargs):
         out = self.references.get(path)
+        if _is_multi_segment(out):
+            size = self._segments_size(path)
+            if size is None:
+                raise ReferenceResolutionError(
+                    f"Size of {path!r} is unknown: it contains a whole-file "
+                    "segment with no bounded length"
+                )
+            return {"name": path, "type": "file", "size": size}
         if isinstance(out, (list, tuple)) and len(out) == 1:
             # whole remote file: the size must come from the remote FS, which
             # cannot be called synchronously from inside the event loop
@@ -1326,10 +1907,28 @@ class ReferenceFileSystem(AsyncFileSystem):
                     out[k] = v.decode("ascii")
                 except UnicodeDecodeError:
                     out[k] = (b"base64:" + base64.b64encode(v)).decode()
+            elif _is_multi_segment(v):
+                out[k] = [self._json_safe_segment(seg) for seg in v]
             else:
                 out[k] = v
         with fsspec.open(url, "wb", **storage_options) as f:
             f.write(json.dumps({"version": 1, "refs": out}).encode())
+
+    @staticmethod
+    def _json_safe_segment(segment):
+        """Make one segment JSON serializable, base64-encoding raw bytes."""
+        if isinstance(segment, (list, tuple)):
+            return list(segment)
+        if isinstance(segment, dict) and isinstance(
+            segment.get("inline"), (bytes, bytearray)
+        ):
+            return {
+                **segment,
+                "inline": (
+                    b"base64:" + base64.b64encode(bytes(segment["inline"]))
+                ).decode(),
+            }
+        return segment
 
 
 class ReferenceFile(AbstractBufferedFile):
@@ -1385,3 +1984,74 @@ class ReferenceFile(AbstractBufferedFile):
         end = min(end + self.start, self.end)
         self.f.seek(start)
         return self.f.read(end - start)
+
+
+class MultiSegmentFile(io.RawIOBase):
+    """Random-access view over an ordered-segment logical file.
+
+    Positions are logical: ``seek``/``read`` operate on the concatenated
+    segment coordinates, and each read is resolved to the segments it
+    overlaps, fetching only the underlying ranges it needs.
+    """
+
+    def __init__(self, fs, path, mode="rb", block_size=None, **kwargs):
+        if mode != "rb":
+            raise NotImplementedError("Multi-segment references are read-only")
+        self.fs = fs
+        self.path = fs._strip_protocol(path)
+        self._segments = fs._resolve_segments(self.path)
+        self._size = _known_length(self._segments)
+        if self._size is None:
+            raise ReferenceResolutionError(
+                f"Cannot open {self.path!r} for random access: it contains a "
+                "whole-file segment with no bounded length"
+            )
+        self._loc = 0
+        super().__init__()
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def tell(self):
+        return self._loc
+
+    def seek(self, loc, whence=0):
+        if whence == 0:
+            nloc = loc
+        elif whence == 1:
+            nloc = self._loc + loc
+        elif whence == 2:
+            nloc = self._size + loc
+        else:
+            raise ValueError(f"invalid whence ({whence}, should be 0, 1 or 2)")
+        if nloc < 0:
+            raise ValueError("Seek before start of file")
+        self._loc = nloc
+        return self._loc
+
+    def read(self, size=-1):
+        if self.closed:
+            raise ValueError("I/O operation on closed file.")
+        if size is None or size < 0:
+            size = self._size - self._loc
+        end = min(self._loc + size, self._size)
+        if end <= self._loc:
+            return b""
+        data = self.fs._cat_multi(
+            self.path,
+            self._loc,
+            end,
+            self.fs._fetch_ranges,
+            segments=self._segments,
+        )
+        self._loc += len(data)
+        return data
+
+    def readinto(self, b):
+        out = memoryview(b).cast("B")
+        data = self.read(out.nbytes)
+        out[: len(data)] = data
+        return len(data)
