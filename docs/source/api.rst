@@ -101,6 +101,15 @@ Base Classes
 .. autoclass:: fsspec.spec.Transaction
    :members:
 
+Exceptions
+----------
+
+.. autoclass:: fsspec.exceptions.ConsistencyError
+
+.. autoclass:: fsspec.exceptions.ObjectChangedError
+
+.. autoclass:: fsspec.exceptions.ConsistencyNotSupportedError
+
 .. _implementations:
 
 Built-in Implementations

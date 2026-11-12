@@ -8,6 +8,7 @@ from pathlib import PurePath, PureWindowsPath
 from typing import Any
 
 from fsspec import AbstractFileSystem
+from fsspec.exceptions import ObjectChangedError
 from fsspec.implementations.local import LocalFileSystem
 from fsspec.utils import stringify_path, tokenize
 
@@ -302,11 +303,27 @@ class MemoryFileSystem(AbstractFileSystem):
         block_size=None,
         autocommit=True,
         cache_options=None,
+        consistency=None,
         **kwargs,
     ):
         if mode in {"rb+", "wb+", "ab+", "xb+"}:
             mode = mode[0] + "+b"
         path = self._strip_protocol(path)
+        if consistency and "r" in mode:
+            # Consistent reads go through the buffered file machinery so the
+            # version bound at open time is enforced on every range fetch.
+            from fsspec.spec import AbstractBufferedFile
+
+            return AbstractBufferedFile(
+                self,
+                path,
+                mode,
+                block_size,
+                autocommit,
+                cache_options=cache_options,
+                consistency=consistency,
+                **kwargs,
+            )
         if "x" in mode and self.exists(path):
             raise FileExistsError
         if path in self.pseudo_dirs or (
@@ -368,9 +385,11 @@ class MemoryFileSystem(AbstractFileSystem):
         if source_is_file:
             if self.isdir(path2):
                 raise IsADirectoryError(path2)
-            self.store[path2] = MemoryFile(
-                self, path2, self.store[path1].getvalue()
-            )  # implicit copy
+            new = MemoryFile(self, path2, self.store[path1].getvalue())  # implicit copy
+            if path2 in self.store:
+                # keep the version monotonic across same-path overwrites
+                new.version = self.store[path2].version + 1
+            self.store[path2] = new
         else:
             if self.isfile(path2):
                 raise FileExistsError(path2)
@@ -384,6 +403,29 @@ class MemoryFileSystem(AbstractFileSystem):
             return bytes(self.store[path].getbuffer()[start:end])
         except KeyError as e:
             raise FileNotFoundError(path) from e
+
+    def version(self, path):
+        """Return the in-memory object version.
+
+        Every content-changing write bumps :attr:`MemoryFile.version`, so the
+        token changes even for same-length overwrites, unlike size or
+        modification time.
+        """
+        path = self._strip_protocol(path)
+        try:
+            return "version_id", self.store[path].version
+        except KeyError as e:
+            raise FileNotFoundError(path) from e
+
+    def _fetch_consistent(self, path, start, end, version):
+        path = self._strip_protocol(path)
+        current = self.version(path)
+        if current != version:
+            raise ObjectChangedError(
+                f"{path!r} changed during a consistent read: expected version "
+                f"{version!r}, found {current!r}"
+            )
+        return self.cat_file(path, start=start, end=end)
 
     def _rm(self, path):
         path = self._strip_protocol(path)
@@ -451,6 +493,7 @@ class MemoryFile(BytesIO):
         self.path = path
         self.created = datetime.now(tz=UTC)
         self.modified = datetime.now(tz=UTC)
+        self.version = 1
         if data:
             super().__init__(data)
             self.seek(0)
@@ -463,6 +506,7 @@ class MemoryFile(BytesIO):
         written = super().write(data)
         if written:
             self.modified = datetime.now(tz=UTC)
+            self.version += 1
         return written
 
     def writelines(self, lines):
@@ -470,8 +514,11 @@ class MemoryFile(BytesIO):
             self.write(line)
 
     def truncate(self, size=None):
+        old = self.getbuffer().nbytes
         size = super().truncate(size)
         self.modified = datetime.now(tz=UTC)
+        if size != old:
+            self.version += 1
         return size
 
     def __enter__(self):
@@ -484,5 +531,10 @@ class MemoryFile(BytesIO):
         pass
 
     def commit(self):
+        previous = self.fs.store.get(self.path) if self.fs is not None else None
+        if previous is not None and previous is not self:
+            # Replacements must keep the version monotonically increasing so
+            # same-length overwrites get a distinct identity token.
+            self.version = previous.version + 1
         self.fs.store[self.path] = self
         self.modified = datetime.now(tz=UTC)

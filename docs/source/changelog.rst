@@ -6,6 +6,20 @@ Dev
 
 Enhancements
 
+- Add an opt-in consistent-read mode (``open(..., consistency=True)`` or
+  ``consistency="snapshot"``). The handle binds to the remote object's
+  verifiable version at open time via the new
+  :meth:`fsspec.spec.AbstractFileSystem.version` and
+  :meth:`fsspec.spec.AbstractFileSystem._fetch_consistent` hooks, enforces it
+  on every range fetch through the read caches, treats in-bounds short reads
+  as changes, re-checks at ``close()`` and raises
+  :class:`fsspec.exceptions.ObjectChangedError` instead of stitching blocks
+  from different versions. Backends without a version id, generation, etag or
+  checksum raise :class:`fsspec.exceptions.ConsistencyNotSupportedError` at
+  open time; size and modification time alone are never accepted. Default
+  reads are unchanged. The memory filesystem now exposes monotonic object
+  versions.
+
 - List TAR archive descendants from the existing directory cache without
   rescanning the full archive for each directory.
 

@@ -63,6 +63,31 @@ buffer, you can do
    with fs.open(path, mode='rb', cache_type='readahead') as f:
        use_for_something(f)
 
+Consistent reads
+----------------
+
+If a remote object is overwritten while it is being read, the default behaviour
+is to keep serving cached blocks from the old content and fetch new blocks from
+the new content, so one file handle can return bytes stitched together from
+different versions. Passing ``consistency=True`` (or ``"snapshot"``) to
+``open`` binds the handle to the object version current at open time: every
+range fetch is verified against that version, and the read fails with
+``fsspec.exceptions.ObjectChangedError`` instead of mixing versions.
+
+.. code-block:: python
+
+   with fs.open(path, mode='rb', consistency=True) as f:
+       data = f.read()  # guaranteed to come from one object version
+
+The identity must be verifiable: the backend has to provide a version token
+(version id, generation, etag or checksum) via
+:meth:`fsspec.spec.AbstractFileSystem.version`, and/or enforce the bound
+version on range reads via
+:meth:`fsspec.spec.AbstractFileSystem._fetch_consistent`. File size and
+modification time alone are not sufficient, so backends without such a token
+raise ``fsspec.exceptions.ConsistencyNotSupportedError`` at open time rather
+than pretending to be consistent.
+
 Transparent text-mode and compression
 -------------------------------------
 

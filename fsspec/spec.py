@@ -15,6 +15,7 @@ from typing import Any
 from .callbacks import DEFAULT_CALLBACK
 from .config import apply_config, conf
 from .dircache import DirCache
+from .exceptions import ConsistencyNotSupportedError, ObjectChangedError
 from .transaction import Transaction
 from .utils import (
     _unstrip_protocol,
@@ -819,6 +820,84 @@ class AbstractFileSystem(metaclass=_Cached):
         """
         return int(tokenize(self.info(path)), 16)
 
+    #: Info-dict keys that are accepted as a verifiable object version by the
+    #: default implementation of :meth:`version`. Modification time and size
+    #: are deliberately absent: neither can detect a same-size overwrite.
+    _version_info_keys = (
+        "version_id",
+        "version",
+        "generation",
+        "etag",
+        "ETag",
+        "checksum",
+    )
+
+    def version(self, path):
+        """Return the verifiable identity token of the object at ``path``.
+
+        The token identifies one specific version of the object: it must stay
+        the same while the bytes are unchanged, and change whenever the bytes
+        are replaced. Backends with native versioning should return the
+        version id, generation or etag, for example.
+
+        The default implementation only trusts backend-provided version
+        fields in :meth:`info` (see :attr:`_version_info_keys`). File size and
+        modification time are never accepted, because an overwrite that keeps
+        the same length (or happens within the timestamp resolution) would be
+        invisible to them. Filesystems without a suitable token must raise
+        :class:`~fsspec.exceptions.ConsistencyNotSupportedError`, so callers
+        cannot rely on consistency that the backend cannot guarantee.
+
+        Returns
+        -------
+        object
+            An opaque, hashable token for the current object version.
+        """
+        info = self.info(path)
+        for key in self._version_info_keys:
+            token = info.get(key)
+            if token is not None:
+                return key, token
+        raise ConsistencyNotSupportedError(
+            f"{type(self).__name__} cannot provide a verifiable version for "
+            f"{path!r}: info() exposes no version id, generation, etag or "
+            "checksum. Size and modification time are not sufficient for "
+            "consistent reads."
+        )
+
+    def _fetch_consistent(self, path, start, end, version):
+        """Fetch a byte range while enforcing a bound object version.
+
+        Parameters
+        ----------
+        path: str
+            File location.
+        start, end: int
+            Byte range, as for :meth:`cat_file`.
+        version: object
+            The token returned by :meth:`version` at open time.
+
+        Returns
+        -------
+        bytes
+
+        Raises
+        ------
+        ObjectChangedError
+            If the backend still exposes a different version. Backends that
+            can evaluate the condition atomically (conditional requests)
+            should do so and translate a failed precondition into this error.
+        ConsistencyNotSupportedError
+            If version-enforced reads cannot be performed at all.
+        """
+        current = self.version(path)
+        if current != version:
+            raise ObjectChangedError(
+                f"{path!r} changed during a consistent read: expected version "
+                f"{version!r}, found {current!r}"
+            )
+        return self.cat_file(path, start=start, end=end)
+
     def size(self, path):
         """Size in bytes of file"""
         return self.info(path).get("size", None)
@@ -1426,6 +1505,7 @@ class AbstractFileSystem(metaclass=_Cached):
         block_size=None,
         autocommit=True,
         cache_options=None,
+        consistency=None,
         **kwargs,
     ):
         """Return raw bytes-mode file-like from the file-system"""
@@ -1436,6 +1516,7 @@ class AbstractFileSystem(metaclass=_Cached):
             block_size,
             autocommit,
             cache_options=cache_options,
+            consistency=consistency,
             **kwargs,
         )
 
@@ -1446,6 +1527,7 @@ class AbstractFileSystem(metaclass=_Cached):
         block_size=None,
         cache_options=None,
         compression=None,
+        consistency=None,
         **kwargs,
     ):
         """
@@ -1471,6 +1553,19 @@ class AbstractFileSystem(metaclass=_Cached):
             If given, open file using compression codec. Can either be a compression
             name (a key in ``fsspec.compression.compr``) or "infer" to guess the
             compression from the filename suffix.
+        consistency: None, bool or str, default None
+            Read consistency mode. With the default (``None``/``False``), reads
+            behave as before: cached blocks and later range fetches may come
+            from different versions of a path that is overwritten while the
+            file is open. Pass ``True`` or ``"snapshot"`` to bind the handle to
+            the object version present at open time: every range fetch is
+            verified against that version and raises
+            :class:`~fsspec.exceptions.ObjectChangedError` if the remote object
+            has changed, instead of silently mixing versions. Requires the
+            filesystem to provide a verifiable identity via
+            :meth:`version`; otherwise opening raises
+            :class:`~fsspec.exceptions.ConsistencyNotSupportedError`. Only
+            applies to read mode.
         encoding, errors, newline: passed on to TextIOWrapper for text mode
         """
         import io
@@ -1491,6 +1586,7 @@ class AbstractFileSystem(metaclass=_Cached):
                     block_size=block_size,
                     cache_options=cache_options,
                     compression=compression,
+                    consistency=consistency,
                     **kwargs,
                 ),
                 **text_kwargs,
@@ -1503,6 +1599,7 @@ class AbstractFileSystem(metaclass=_Cached):
                 block_size=block_size,
                 autocommit=ac,
                 cache_options=cache_options,
+                consistency=consistency,
                 **kwargs,
             )
             if not ac and "r" not in mode:
@@ -2018,6 +2115,7 @@ class AbstractBufferedFile(io.IOBase):
         cache_type="readahead",
         cache_options=None,
         size=None,
+        consistency=None,
         **kwargs,
     ):
         """
@@ -2043,6 +2141,14 @@ class AbstractBufferedFile(io.IOBase):
             by `cache_type`.
         size: int
             If given and in read mode, suppressed having to look up the file size
+        consistency: None, bool or str, default None
+            Pass ``True`` or ``"snapshot"`` to bind this read handle to the
+            object version current at open time. Every later range fetch is
+            checked against that version; a change raises
+            :class:`~fsspec.exceptions.ObjectChangedError` instead of mixing
+            old cached blocks with bytes from a newer version. Requires
+            ``fs.version(path)`` to succeed. ``None``/``False`` keeps the
+            legacy behaviour. Ignored outside read mode.
         kwargs:
             Gets stored as self.kwargs
         """
@@ -2075,7 +2181,19 @@ class AbstractBufferedFile(io.IOBase):
 
         if mode not in {"ab", "rb", "wb", "xb"}:
             raise NotImplementedError("File mode not supported")
+        self.consistency = self._normalise_consistency(consistency)
+        # Set when a read has already failed the version check; close() then
+        # only releases the cache instead of re-raising and masking the first
+        # error (e.g. when propagating out of a context manager).
+        self._consistency_broken = False
         if mode == "rb":
+            if self.consistency:
+                # Bind the handle to one specific object version before any
+                # range fetch happens. Backends that cannot prove identity
+                # raise ConsistencyNotSupportedError here, at open time.
+                self._version = self.fs.version(self.path)
+            else:
+                self._version = None
             if size is not None:
                 self.size = size
             else:
@@ -2084,10 +2202,22 @@ class AbstractBufferedFile(io.IOBase):
                 self.blocksize, self._fetch_range, self.size, **cache_options
             )
         else:
+            self._version = None
             self.buffer = io.BytesIO()
             self.offset = None
             self.forced = False
             self.location = None
+
+    @staticmethod
+    def _normalise_consistency(consistency):
+        if consistency in (None, False):
+            return False
+        if consistency is True or consistency == "snapshot":
+            return True
+        raise ValueError(
+            "consistency must be None, False, True or 'snapshot', "
+            f"got {consistency!r}"
+        )
 
     @property
     def len(self):
@@ -2266,7 +2396,21 @@ class AbstractBufferedFile(io.IOBase):
         pass
 
     def _fetch_range(self, start, end):
-        """Get the specified set of bytes from remote"""
+        """Get the specified set of bytes from remote
+
+        In consistent-read mode the range is fetched through
+        :meth:`AbstractFileSystem._fetch_consistent`, so it is verified
+        against the version bound at open time before any bytes are
+        returned.
+        """
+        if getattr(self, "consistency", False):
+            try:
+                return self.fs._fetch_consistent(
+                    self.path, start, end, self._version
+                )
+            except ObjectChangedError:
+                self._consistency_broken = True
+                raise
         return self.fs.cat_file(self.path, start=start, end=end)
 
     def read(self, length=-1):
@@ -2297,6 +2441,20 @@ class AbstractBufferedFile(io.IOBase):
             self.loc + length,
             self.cache._log_stats(),
         )
+        if getattr(self, "consistency", False) and self.size is not None:
+            # Reads that run past the bound end of file are legitimately
+            # short; only a shortfall within the size bound at open time
+            # indicates that the object was replaced by a shorter one. With
+            # an unknown size there is no way to tell them apart, so the
+            # version check on each fetch remains the only guarantee.
+            expected = min(length, max(0, self.size - self.loc))
+            if len(out) < expected:
+                self._consistency_broken = True
+                raise ObjectChangedError(
+                    f"Short read from {self.path!r} during a consistent read: "
+                    f"expected {expected} bytes at offset {self.loc}, got "
+                    f"{len(out)} (bound version {self._version!r})"
+                )
         self.loc += len(out)
         return out
 
@@ -2390,12 +2548,32 @@ class AbstractBufferedFile(io.IOBase):
             return
         try:
             if self.mode == "rb":
-                cache = getattr(self, "cache", None)
-                if cache is not None:
-                    close = getattr(cache, "close", None)
-                    if callable(close):
-                        close()
-                self.cache = None
+                try:
+                    if (
+                        getattr(self, "consistency", False)
+                        and not getattr(self, "_consistency_broken", False)
+                        and getattr(self, "_version", None) is not None
+                    ):
+                        # Final check that the bound version is still the live
+                        # one. A mismatch surfaces as an error from close(),
+                        # including the context-manager exit. If an earlier read
+                        # already failed, that error takes priority and close()
+                        # just releases the resources.
+                        current = self.fs.version(self.path)
+                        if current != self._version:
+                            self._consistency_broken = True
+                            raise ObjectChangedError(
+                                f"{self.path!r} changed before the consistent "
+                                f"read was closed: expected version "
+                                f"{self._version!r}, found {current!r}"
+                            )
+                finally:
+                    cache = getattr(self, "cache", None)
+                    if cache is not None:
+                        close = getattr(cache, "close", None)
+                        if callable(close):
+                            close()
+                    self.cache = None
             else:
                 if not getattr(self, "forced", True):
                     self.flush(force=True)
@@ -2432,11 +2610,17 @@ class AbstractBufferedFile(io.IOBase):
             self.autocommit,
             self.cache.name if self.cache else "none",
             self.kwargs,
+            getattr(self, "consistency", False),
         )
 
     def __del__(self):
         if not self.closed:
-            self.close()
+            try:
+                self.close()
+            except Exception:
+                # Garbage collection must never surface an unraisable
+                # exception (e.g. a consistency check on a vanished object).
+                pass
 
     def __str__(self):
         return f"<File-like object {type(self.fs).__name__}, {self.path}>"
@@ -2450,7 +2634,18 @@ class AbstractBufferedFile(io.IOBase):
         self.close()
 
 
-def reopen(fs, path, mode, blocksize, loc, size, autocommit, cache_type, kwargs):
+def reopen(
+    fs,
+    path,
+    mode,
+    blocksize,
+    loc,
+    size,
+    autocommit,
+    cache_type,
+    kwargs,
+    consistency=False,
+):
     file = fs.open(
         path,
         mode=mode,
@@ -2458,6 +2653,7 @@ def reopen(fs, path, mode, blocksize, loc, size, autocommit, cache_type, kwargs)
         autocommit=autocommit,
         cache_type=cache_type,
         size=size,
+        consistency=consistency,
         **kwargs,
     )
     if loc > 0:
